@@ -6,6 +6,15 @@ support, and writes installers' instructions for them. Classifier itself stays o
 because its licence texts come from Linux's `/usr/share/common-licenses` and *Review
 with Claude* runs Claude in a Linux Docker container.
 
+## Download
+
+Ready-to-run downloads (executable programs), with nothing else to install:
+
+* **Linux:** [Classifier-Linux-x86_64.AppImage](https://github.com/zklaas/classifier/releases/latest/download/Classifier-Linux-x86_64.AppImage)
+
+The [release page](https://github.com/zklaas/classifier/releases/latest) says how to run it.
+To install from the source code at the command line instead, see below.
+
 Sorts your software into **Development Groups**, decides which of it is **Cleared**
 for an open-source licence, writes that licence (with an AI disclosure naming Claude),
 records which operating systems each one supports, and keeps GitHub in line.
