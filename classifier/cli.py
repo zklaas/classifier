@@ -185,7 +185,8 @@ def cmd_catalogue(a):
         sys.exit("gh is not logged in (gh auth login): the catalogue lists only software "
                  "in public repositories, so GitHub must be read.")
     _, placed = github.audit(reg, github.snapshot(owner), statuses)
-    text = catalogue.page(reg, statuses, placed)
+    text = catalogue.page(reg, statuses, placed,
+                          catalogue.find_downloads(catalogue.listed(reg, statuses, placed), placed))
     if a.out:
         model.Path(a.out).write_text(text, encoding="utf-8")
         print(f"Wrote {a.out} ({len(catalogue.listed(reg, statuses, placed))} software listed)")

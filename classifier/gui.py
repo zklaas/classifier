@@ -1636,9 +1636,15 @@ class MainWindow(QMainWindow):
             o = owner or model.gh_login()
             if not o:
                 raise github.GhError("gh is not logged in. Run `gh auth login` in a terminal.")
-            return github.snapshot(o, progress=lambda i, n, r: progress(f"{r} ({i + 1}/{n})"))
+            snap = github.snapshot(o, progress=lambda i, n, r: progress(f"{r} ({i + 1}/{n})"))
+            statuses = {n: status.of(sw, self.reg.settings) for n, sw in self.reg.software.items()}
+            _, placed = github.audit(self.reg, snap, statuses)
+            progress("Looking for downloadable packages…")
+            return snap, catalogue.find_downloads(
+                catalogue.listed(self.reg, statuses, placed), placed)
 
-        def done(snap):
+        def done(res):
+            snap, self._downloads = res
             self.snap = snap
             self.refresh_all()
             _, self.placements = github.audit(self.reg, snap, self.statuses)
@@ -1646,7 +1652,8 @@ class MainWindow(QMainWindow):
         self._run("Reading GitHub", work, done)
 
     def _catalogue_dialog(self):
-        text = catalogue.page(self.reg, self.statuses, self.placements)
+        text = catalogue.page(self.reg, self.statuses, self.placements,
+                              getattr(self, "_downloads", None))
         n = len(catalogue.listed(self.reg, self.statuses, self.placements))
         d = QDialog(self)
         d.setWindowTitle("Catalogue")
@@ -1757,4 +1764,9 @@ def run(argv):
     app.setDesktopFileName("classifier")
     w = MainWindow()
     w.show()
-    return app.exec()
+    code = app.exec()
+    # The window is closed: let background work (e.g. a catalogue update) finish,
+    # then leave for good, so no Classifier process is left running unseen.
+    for wk in list(w.workers):
+        wk.wait(15000)
+    os._exit(code)

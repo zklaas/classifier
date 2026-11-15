@@ -258,6 +258,9 @@ class Catalogue(unittest.TestCase):
         self.assertIn("Type these into a **terminal**", text)
         self.assertIn("Download ZIP", text)
         self.assertNotIn("untested", text)
+        dl = catalogue.entry(reg.software["Shown"], st["Shown"], None,
+                             [("Windows", "https://x/a.exe"), ("Linux", "https://x/a.AppImage")])
+        self.assertIn("**Download** (ready to run, nothing else to install): [Windows](https://x/a.exe)", dl)
         reg.settings["contact"] = "someone@example.org"
         self.assertIn("please write to someone@example.org",
                       catalogue.page(reg, st, {"Shown": [{"repo": "me/shown", "path": "",
