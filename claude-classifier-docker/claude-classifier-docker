@@ -1,0 +1,2227 @@
+#!/usr/bin/env python3
+"""claude-classifier-docker — run Claude Code in a locked-down Docker container.
+
+(Generated from ZIS claude-docker by Classifier/claude-classifier-docker/make.py: its own config and policy; the sign-in and images of claude-docker.)
+
+Usage:
+  claude-classifier-docker                  Claude in this terminal, on the local folder
+  claude-classifier-docker DIR              ... on DIR instead
+  claude-classifier-docker --gui [DIR]      ... in a separate "Claude window" with Session,
+                                 Review and Help menus
+  claude-classifier-docker --shell [DIR]    a bash shell in the same container, not Claude
+
+What a session can see and do (hardening of 2026-09-28):
+  - The launch folder is mounted READ-ONLY at /workspace. --write SUBDIR makes
+    one subfolder writable (repeatable; "." means all of it).
+  - Credential-looking files in it (and those in ~/.config/claude-classifier-docker/hide.txt)
+    show up empty, and the launch lists them.
+  - Network: only Anthropic and the hosts in ~/.config/claude-classifier-docker/allowed-hosts.txt,
+    through a proxy outside the container. No DNS, no route to this machine.
+  - Its own Claude config, rebuilt fresh each session, never your ~/.claude.
+  - Memory a session writes is held for your review (claude-classifier-docker --memory).
+  - Policy it cannot change: prompts only, no hooks, no MCP servers, no claude.ai
+    connectors, no artifacts (claude-classifier-docker --policy).
+
+Options for a launch:
+  --write SUBDIR        make SUBDIR of the launch folder writable (repeatable)
+  --allow-host HOST     also allow HOST for this launch only (repeatable)
+  --brief-file FILE     instructions given out of sight (appended system prompt)
+  --prompt-file FILE    an initial prompt, shown as the first message
+  --settings-file FILE  extra Claude Code settings for this session only
+  --model NAME|N        a different model for this session only
+  --continue            reopen the latest Docker session, with its launch settings
+  --resume [ID]         reopen a chosen session (a list if no ID)
+
+Commands run on this machine (never from inside a container):
+  --allow HOST [--keep] let running sessions reach HOST now; --keep saves it
+  --memory              review memory changes sessions have made
+  --policy [edit]       show (or edit) the policy the container can't change
+  --models              list the models and choose your default
+  --default-model NAME  set your default without the menu
+  --upgrade             rebuild the images with the newest Claude Code
+  --selftest            check the protections one by one
+
+The launch folder is DIR if given, else CLAUDE_CLASSIFIER_DOCKER_WORKSPACE (ZIS sets it),
+else ~/.config/claude-classifier-docker/default-workspace — the local folder, i.e. where ZIS
+is installed (the install writes it). Your home folder, the
+Windows profile folder and whole drives are refused.
+"""
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+CONF = HOME / ".config" / "claude-classifier-docker"          # also the image build context
+DATA = HOME / ".local" / "share" / "claude-classifier-docker"  # login, runs, pending memory
+CACHE = HOME / ".cache" / "claude-classifier-docker"
+RUNS = DATA / "run"
+PENDING = DATA / "memory-pending"
+INPUTS = DATA / "session-inputs"
+SESSIONS = DATA / "sessions.json"
+CREDS = DATA / "credentials.json"
+CLAUDE_JSON = DATA / "claude.json"
+POLICY_DIR = CONF / "policy"
+POLICY = POLICY_DIR / "managed-settings.json"
+POLICY_ACCEPTED = DATA / "policy-accepted.sha256"
+ALLOWED_HOSTS = CONF / "allowed-hosts.txt"
+HIDE_FILE = CONF / "hide.txt"
+DEFAULT_WS_FILE = CONF / "default-workspace"
+CONTAINER_SETTINGS = CONF / "settings.json"
+SQUID_CONF = CONF / "proxy" / "squid.conf"
+MODEL_FILE = CONF / "model"
+HOST_PROJECTS = HOME / ".claude" / "projects" / "-workspace"   # Docker transcripts
+APPROVED_MEMORY = HOST_PROJECTS / "memory"
+
+IMAGE = "claude-docker:latest"
+IMAGE_LAYOUT = "2"                 # the Dockerfile's claude_docker_layout label"
+PROXY_IMAGE = "claude-docker-proxy:latest"
+LABEL = "claude-classifier-docker.run"
+BUILTIN_MODEL = "claude-opus-5-5"
+ANTHROPIC_HOSTS = ["api.anthropic.com", "claude.ai", "platform.claude.com"]
+# Hosts only Claude Code's OWN background work uses (plugin downloads, update and
+# changelog checks, telemetry). Blocked like any other, but not reported as a
+# refusal worth acting on, so they don't tempt anyone to allow them.
+CLAUDE_BACKGROUND_HOSTS = {"downloads.claude.ai", "raw.githubusercontent.com",
+                           "storage.googleapis.com", "http-intake.logs.us5.datadoghq.com",
+                           "browser-intake-us5-datadoghq.com", "mcp-proxy.anthropic.com",
+                           "bridge.claudeusercontent.com"}
+TITLE = "Claude window"            # zis/winplace.py snaps on exactly this title
+
+MODELS = [
+    ("claude-opus-5-5", "Opus 5.5: the newest Opus (built-in default)"),
+    ("claude-fable-5-1", "Fable 5.1: the most capable; slower, needs usage credits"),
+    ("claude-opus-5", "Opus 5: the previous Opus"),
+    ("claude-opus-4-8", "Opus 4.8: claude-classifier-docker's default until 2026-09-24"),
+    ("claude-sonnet-5", "Sonnet 5: faster and lighter"),
+    ("claude-haiku-4-5", "Haiku 4.5: the fastest and lightest"),
+    ("opus", "always the newest Opus"),
+    ("sonnet", "always the newest Sonnet"),
+    ("fable", "always the newest Fable"),
+]
+
+# Credential-looking names hidden in every launch folder, up to 4 levels deep.
+MASK_PATTERNS = [".databrickscfg", ".databricks", ".env", ".env.*", "*.env", "*.pem",
+                 "*.key", ".netrc", ".git-credentials", "*token*.json", "*credential*"]
+# The launch folder's own Claude project settings are for HOST sessions (they hold
+# allow rules such as Bash(python3 -)); a container session must not inherit them.
+MASK_ROOT_PATHS = [".claude/settings.json", ".claude/settings.local.json", "CLAUDE.md",
+                   ".claude/CLAUDE.md"]
+MASK_DEPTH = 4
+SKIP_DIRS = {".venv", "venv", "site-packages", "node_modules", ".git", "__pycache__"}
+
+# Keys kept from the container's .claude.json between sessions; everything else
+# (per-project allowedTools, mcpServers, ...) is dropped, so a session cannot
+# leave settings for the next one.
+CLAUDE_JSON_KEEP = {"oauthAccount", "userID", "hasCompletedOnboarding",
+                    "lastOnboardingVersion", "theme", "firstStartTime", "installMethod",
+                    "numStartups", "lastReleaseNotesSeen", "customApiKeyResponses",
+                    "hasSeenTasksHint", "hasAvailableSubscription"}
+PROJECT_KEEP = {"hasTrustDialogAccepted", "hasCompletedProjectOnboarding",
+                "projectOnboardingSeenCount"}
+
+# The policy's safety keys: (path, safe value, what it means in plain words).
+SAFETY = [
+    (("permissions", "disableBypassPermissionsMode"), "disable", "no bypass mode"),
+    (("disableAutoMode",), "disable", "no auto mode"),
+    (("permissions", "defaultMode"), "default", "sessions start in Manual (prompts)"),
+    (("allowManagedHooksOnly",), True, "no hooks from workspace or user files"),
+    (("allowManagedMcpServersOnly",), True, "only the policy's MCP servers"),
+    (("allowedMcpServers",), [], "the policy allows no MCP servers"),
+    (("disableClaudeAiConnectors",), True, "no claude.ai connectors (Gmail, M365, ...)"),
+    (("enableArtifact",), False, "no artifacts"),
+]
+
+HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+
+class Refused(Exception):
+    """A launch refused with a reason the person must see."""
+
+
+def say(msg="", err=False):
+    try:
+        print(msg, file=sys.stderr if err else sys.stdout, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def read_json(path: Path, default=None):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def _fit(widget, w, h):
+    """Resize a window, but never beyond the screen it opens on (added by
+    Classifier's make.py: a 1280x615 display could not show the whole window)."""
+    try:
+        from PyQt6.QtGui import QGuiApplication
+        scr = QGuiApplication.primaryScreen()
+        if scr is not None:
+            g = scr.availableGeometry()
+            w, h = min(w, g.width() - 16), min(h, g.height() - 48)
+    except Exception:
+        pass
+    widget.resize(w, h)
+
+
+def write_json(path: Path, data, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def list_lines(path: Path) -> list[str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [ln.strip() for ln in text.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+
+
+def docker(*args, check=False, quiet=True, **kw):
+    return subprocess.run(["docker", *args], check=check, text=True,
+                          stdout=subprocess.PIPE if quiet else None,
+                          stderr=subprocess.PIPE if quiet else None, **kw)
+
+
+def rmtree(path: Path):
+    """Remove a folder; if something in it is root-owned (a mount point Docker
+    created), remove that through Docker, which can."""
+    shutil.rmtree(path, ignore_errors=True)
+    if path.exists() and path.is_relative_to(DATA) and shutil.which("docker"):
+        docker("run", "--rm", "--user", "0", "--network", "none", "--entrypoint", "rm",
+               "-v", f"{path.parent}:/p", PROXY_IMAGE, "-rf", f"/p/{path.name}")
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+# ─────────────────────────────── the model ────────────────────────────────
+def saved_default() -> str:
+    lines = list_lines(MODEL_FILE)
+    return lines[0] if lines else BUILTIN_MODEL
+
+
+def resolve_model(choice: str):
+    if choice.isdigit():
+        n = int(choice)
+        return MODELS[n - 1][0] if 1 <= n <= len(MODELS) else None
+    return choice if re.match(r"^[A-Za-z][][A-Za-z0-9._:@/-]*$", choice) else None
+
+
+def show_models(current: str):
+    for i, (name, what) in enumerate(MODELS, 1):
+        say(f"  {'*' if name == current else ' '} {i}  {name:<17} {what}")
+
+
+def save_default(model: str):
+    MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MODEL_FILE.write_text(model + "\n", encoding="utf-8")
+    say(f"claude-classifier-docker: your default model is now {model} (saved in {MODEL_FILE}).")
+    env = os.environ.get("ANTHROPIC_MODEL")
+    if env and env != model:
+        say(f"  But ANTHROPIC_MODEL={env} is set in this environment, and it")
+        say("  comes first. Unset it for your default to be used.")
+
+
+def pick_model(arg):
+    if arg:
+        m = resolve_model(arg)
+        if not m:
+            raise Refused("not a model name or a number from the list. "
+                          "See the list with: claude-classifier-docker --models")
+        return m, "--model"
+    if os.environ.get("ANTHROPIC_MODEL"):
+        return os.environ["ANTHROPIC_MODEL"], "ANTHROPIC_MODEL in the environment"
+    if list_lines(MODEL_FILE):
+        return saved_default(), "your default"
+    return BUILTIN_MODEL, "built-in default; choose yours with: claude-classifier-docker --models"
+
+
+def cmd_models():
+    current = saved_default()
+    say("Claude models for claude-classifier-docker (* = your default):")
+    show_models(current)
+    say("\n  Other model names that Claude Code accepts work too.")
+    if not sys.stdin.isatty():
+        say("  Set your default with: claude-classifier-docker --default-model NAME")
+        return 0
+    while True:
+        try:
+            choice = input(f"Choose a number or type a model name (Enter keeps {current}): ").strip()
+        except EOFError:
+            return 0
+        if not choice:
+            say(f"claude-classifier-docker: your default stays {current}.")
+            return 0
+        m = resolve_model(choice)
+        if m:
+            save_default(m)
+            return 0
+        say(f"  Not a number from 1 to {len(MODELS)} or a model name: {choice}")
+
+
+# ───────────────────────────── docker and images ────────────────────────────
+def ensure_docker():
+    if docker("info").returncode == 0:
+        return
+    if subprocess.run(["docker-ensure"]).returncode != 0 or docker("info").returncode != 0:
+        raise Refused("the Docker daemon is not running and could not be started. "
+                      "Start it with: sudo systemctl start docker (WSL: sudo service docker start)")
+
+
+def latest_claude_code(timeout=10):
+    try:
+        with urllib.request.urlopen(
+                "https://registry.npmjs.org/@anthropic-ai/claude-code/latest",
+                timeout=timeout) as r:
+            return json.load(r).get("version") or ""
+    except Exception:                                   # noqa: BLE001 - offline is fine
+        return ""
+
+
+def image_id(ref):
+    r = docker("image", "inspect", "-f", "{{.Id}}", ref)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def build_images(force: bool):
+    """Build the Claude image and the proxy image if missing (or with --upgrade)."""
+    layout = docker("image", "inspect", "-f",
+                    '{{ index .Config.Labels "claude_docker_layout" }}', IMAGE).stdout.strip()
+    if image_id(IMAGE) and layout != IMAGE_LAYOUT and not force:
+        say(f">>> {IMAGE} was built from an older Dockerfile (before the 2026-09-28 "
+            "hardening); rebuilding it.")
+        force = True
+    if force or not image_id(IMAGE):
+        old = image_id(IMAGE)
+        ver = latest_claude_code()
+        if ver:
+            say(f">>> Building {IMAGE} with Claude Code {ver} (a few minutes)...")
+            rc = docker("build", "--build-arg", f"CLAUDE_CODE_VERSION={ver}", "-t", IMAGE,
+                        str(CONF), quiet=False).returncode
+        else:
+            say(">>> Could not look up the newest Claude Code on npm; building without the cache...")
+            rc = docker("build", "--no-cache", "-t", IMAGE, str(CONF), quiet=False).returncode
+        if rc != 0:
+            raise Refused(f"building {IMAGE} failed (see the output above).")
+        # The replaced image holds ~2 GB on a tight C: drive. Remove it only when
+        # no tag is left (a copy someone tagged to keep stays).
+        new = image_id(IMAGE)
+        if old and old != new:
+            tags = docker("image", "inspect", "-f", "{{len .RepoTags}}", old)
+            if tags.returncode == 0 and tags.stdout.strip() == "0":
+                if docker("image", "rm", old).returncode == 0:
+                    say(">>> Removed the previous image.")
+    if force or not image_id(PROXY_IMAGE):
+        say(f">>> Building {PROXY_IMAGE} (the network allow-list proxy)...")
+        if docker("build", "-t", PROXY_IMAGE, str(CONF / "proxy"), quiet=False).returncode != 0:
+            raise Refused(f"building {PROXY_IMAGE} failed (see the output above).")
+
+
+def version_notice():
+    """Once a day, say when npm has a newer Claude Code than the image."""
+    cache = CACHE / "latest-version"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    if not cache.exists() or time.time() - cache.stat().st_mtime > 86400:
+        v = latest_claude_code(3)
+        cache.write_text((v + "\n") if v else "", encoding="utf-8")
+    latest = (list_lines(cache) or [""])[0]
+    r = docker("image", "inspect", "-f", '{{ index .Config.Labels "claude_code_version" }}', IMAGE)
+    have = r.stdout.strip() if r.returncode == 0 else ""
+    if have == "<no value>":
+        have = ""
+    if latest and have != latest:
+        say(f"claude-classifier-docker: Claude Code {latest} is out; this image has {have or 'an older one'}.", err=True)
+        say("  Upgrade with: claude-classifier-docker --upgrade", err=True)
+
+
+# ─────────────────────────────── the policy ────────────────────────────────
+def _get(d, path):
+    for k in path:
+        if not isinstance(d, dict) or k not in d:
+            return None, False
+        d = d[k]
+    return d, True
+
+
+def policy_loosened(data: dict) -> list[str]:
+    """The safety rules this policy no longer enforces, in plain words."""
+    out = []
+    for path, safe, words in SAFETY:
+        val, found = _get(data, path)
+        if path == ("disableAutoMode",) and not (found and val == safe):
+            val, found = _get(data, ("permissions", "disableAutoMode"))
+        if not found or val != safe:
+            out.append(f"{words} — {'.'.join(path)} is "
+                       f"{json.dumps(val) if found else 'not set'} (safe: {json.dumps(safe)})")
+    return out
+
+
+def policy_describe(data: dict) -> list[str]:
+    loose = {w.split(" — ")[0] for w in policy_loosened(data)}
+    return [("  ✓ " if words not in loose else "  ✗ NOT ENFORCED: ") + words
+            for _, _, words in SAFETY]
+
+
+def policy_check():
+    """Refuse a launch unless the policy exists, parses, and is the accepted one."""
+    if not POLICY.is_file():
+        raise Refused(f"the policy file is missing: {POLICY}\n"
+                      "A session cannot start without it. Restore it, then run: "
+                      "claude-classifier-docker --policy edit")
+    try:
+        data = json.loads(POLICY.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+    except ValueError as exc:
+        raise Refused(f"the policy file is not valid JSON ({exc}): {POLICY}\n"
+                      "Fix it with: claude-classifier-docker --policy edit") from None
+    digest = sha256(POLICY)
+    accepted = (list_lines(POLICY_ACCEPTED) or [""])[0]
+    if not accepted:
+        if policy_loosened(data):
+            raise Refused("the policy loosens safety rules and has never been accepted. "
+                          "Review it with: claude-classifier-docker --policy edit")
+        POLICY_ACCEPTED.parent.mkdir(parents=True, exist_ok=True)
+        POLICY_ACCEPTED.write_text(digest + "\n", encoding="utf-8")
+    elif accepted != digest:
+        raise Refused(f"the policy file changed outside `claude-classifier-docker --policy edit`: {POLICY}\n"
+                      "Review the change with: claude-classifier-docker --policy edit")
+    return data
+
+
+def cmd_policy(action):
+    if action in (None, "show"):
+        data = read_json(POLICY)
+        if not isinstance(data, dict):
+            say(f"The policy file is missing or not valid JSON: {POLICY}")
+            return 1
+        say(f"claude-classifier-docker policy ({POLICY}), which no session can change:")
+        for line in policy_describe(data):
+            say(line)
+        accepted = (list_lines(POLICY_ACCEPTED) or [""])[0]
+        if accepted and accepted != sha256(POLICY):
+            say("\n  The file changed since it was last accepted; launches are refused "
+                "until you run: claude-classifier-docker --policy edit")
+        return 0
+    if action != "edit":
+        say("claude-classifier-docker: --policy takes nothing (show) or 'edit'.", err=True)
+        return 2
+    before = read_json(POLICY, {}) or {}
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
+        fh.write(POLICY.read_text(encoding="utf-8") if POLICY.is_file() else "{}\n")
+        tmp = Path(fh.name)
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or (
+        "nano" if shutil.which("nano") else "vi")
+    try:
+        while True:
+            subprocess.run(shlex.split(editor) + [str(tmp)])
+            try:
+                data = json.loads(tmp.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("not a JSON object")
+                break
+            except ValueError as exc:
+                say(f"That is not valid JSON ({exc}).")
+                if input("Edit again? [Y/n] ").strip().lower() == "n":
+                    say("Nothing changed.")
+                    return 1
+        newly = [w for w in policy_loosened(data) if w not in policy_loosened(before)]
+        if newly:
+            say("\nThis edit LOOSENS these safety rules:")
+            for w in newly:
+                say(f"  - {w}")
+            if input("Accept the loosened policy? Type yes to accept: ").strip().lower() != "yes":
+                say("Nothing changed.")
+                return 1
+        POLICY_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(tmp, POLICY)
+        POLICY_ACCEPTED.parent.mkdir(parents=True, exist_ok=True)
+        POLICY_ACCEPTED.write_text(sha256(POLICY) + "\n", encoding="utf-8")
+        say("Policy saved; it applies from the next launch.")
+        for line in policy_describe(data):
+            say(line)
+        return 0
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+# ──────────────────────────── the launch folder ─────────────────────────────
+def refused_workspace(ws: Path):
+    """Why WS may not be a launch folder, or None."""
+    home = HOME.resolve()
+    s = str(ws)
+    if ":" in s:
+        return "its path contains ':', which Docker cannot mount"
+    if ws == Path("/") or ws == home:
+        return "it is / or your home folder"
+    parts = ws.parts
+    if parts[:2] == ("/", "mnt") and (len(parts) <= 3 or (
+            len(parts) <= 5 and len(parts) >= 4 and parts[3].lower() == "users")):
+        return "it is a whole drive or the Windows users / profile folder"
+    for sensitive in (home / ".claude", home / ".ssh", home / ".config", DATA.resolve()):
+        if sensitive.is_relative_to(ws):
+            return f"it contains {sensitive}"
+        if ws.is_relative_to(sensitive):
+            return f"it is inside {sensitive}"
+    return None
+
+
+def resolve_workspace(arg):
+    if arg:
+        raw, source = arg, "given"
+    elif os.environ.get("CLAUDE_CLASSIFIER_DOCKER_WORKSPACE"):
+        raw, source = os.environ["CLAUDE_CLASSIFIER_DOCKER_WORKSPACE"], "CLAUDE_CLASSIFIER_DOCKER_WORKSPACE"
+    else:
+        lines = list_lines(DEFAULT_WS_FILE)
+        if not lines:
+            raise Refused(
+                "no launch folder: none was given and the local folder is not set.\n"
+                f"Put the folder ZIS is installed in into {DEFAULT_WS_FILE}, e.g.\n"
+                f"  echo /path/to/the/zis/folder > {DEFAULT_WS_FILE}\n"
+                "or name one: claude-classifier-docker DIR")
+        raw, source = os.path.expanduser(os.path.expandvars(lines[0])), str(DEFAULT_WS_FILE)
+    ws = Path(raw).expanduser().resolve()
+    if not ws.is_dir():
+        raise Refused(f"the launch folder does not exist: {raw} (from {source})")
+    why = refused_workspace(ws)
+    if why:
+        raise Refused(f"refusing to mount {ws}: {why}.\n"
+                      "Plain `claude-classifier-docker` uses the local folder; or name a narrower folder.")
+    return ws
+
+
+def resolve_writes(ws: Path, subs) -> list[tuple[Path, str]]:
+    """(real path, path inside /workspace) for each --write; refuse escapes."""
+    out = []
+    for sub in subs or []:
+        p = Path(sub).expanduser()
+        p = p if p.is_absolute() else ws / p
+        p = Path(os.path.abspath(p))
+        if not p.is_relative_to(ws):
+            # an absolute spelling through a symlink to the launch folder
+            real = p.resolve()
+            if real.is_relative_to(ws):
+                p = real
+            else:
+                raise Refused(f"--write {sub}: it is not inside the launch folder {ws}")
+        # Refuse any symlink between the launch folder and the target: Docker
+        # would follow it on the host and could mount an outside folder writable.
+        cur = ws
+        for part in p.relative_to(ws).parts:
+            cur = cur / part
+            if cur.is_symlink():
+                raise Refused(f"--write {sub}: {cur} is a symlink, which could lead "
+                              "outside the launch folder")
+        if not p.is_dir():
+            raise Refused(f"--write {sub}: no such folder: {p}")
+        rel = p.relative_to(ws).as_posix()
+        out.append((p, "/workspace" + ("" if rel == "." else "/" + rel)))
+    return out
+
+
+def find_masks(ws: Path) -> list[tuple[str, bool]]:
+    """(relative path, is_dir) of everything to hide in the launch folder."""
+    names = [p.lower() for p in MASK_PATTERNS]
+    hide = list_lines(HIDE_FILE)
+    rel_paths = MASK_ROOT_PATHS + [h.strip("/") for h in hide if "/" in h.strip("/")]
+    names += [h.lower() for h in hide if "/" not in h.strip("/")]
+    found = {}
+    for rel in rel_paths:
+        p = ws / rel
+        if p.exists() and not p.is_symlink():
+            found[rel] = p.is_dir()
+    base_depth = len(ws.parts)
+    for root, dirs, files in os.walk(ws):
+        r = Path(root)
+        depth = len(r.parts) - base_depth
+        keep = []
+        for d in dirs:
+            if d in SKIP_DIRS or (r / d).is_symlink():
+                continue
+            if any(fnmatch.fnmatchcase(d.lower(), n) for n in names):
+                found[(r / d).relative_to(ws).as_posix()] = True
+                continue                        # hidden whole; no need to look inside
+            keep.append(d)
+        dirs[:] = keep if depth + 1 < MASK_DEPTH else []
+        for f in files:
+            if any(fnmatch.fnmatchcase(f.lower(), n) for n in names):
+                p = r / f
+                if not p.is_symlink():
+                    found[p.relative_to(ws).as_posix()] = False
+    # a path inside an already-hidden folder needs no mount of its own
+    out = sorted(found.items())
+    dirs_hidden = [k for k, v in out if v]
+    return [(k, v) for k, v in out
+            if not any(k != d and k.startswith(d + "/") for d in dirs_hidden)
+            and ":" not in k]
+
+
+# ───────────────────────────── config and login ─────────────────────────────
+def sanitise_claude_json(src, workspace_trust=True) -> dict:
+    data = src if isinstance(src, dict) else {}
+    out = {k: v for k, v in data.items() if k in CLAUDE_JSON_KEEP}
+    proj = ((data.get("projects") or {}).get("/workspace") or {}) if isinstance(
+        data.get("projects"), dict) else {}
+    kept = {k: v for k, v in proj.items() if k in PROJECT_KEEP}
+    if workspace_trust:
+        kept["hasTrustDialogAccepted"] = True
+    out["projects"] = {"/workspace": kept}
+    out["autoUpdates"] = False
+    return out
+
+
+def cred_expiry(path: Path) -> int:
+    d = read_json(path, {}) or {}
+    try:
+        return int((d.get("claudeAiOauth") or {}).get("expiresAt") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+# ─────────────────────────────── memory ────────────────────────────────────
+def tree_hashes(root: Path) -> dict[str, str]:
+    out = {}
+    if root.is_dir():
+        for p in sorted(root.rglob("*")):
+            if p.is_file() and not p.is_symlink():
+                out[p.relative_to(root).as_posix()] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return out
+
+
+def pending_sets() -> list[Path]:
+    if not PENDING.is_dir():
+        return []
+    return sorted((p for p in PENDING.iterdir() if (p / "meta.json").is_file()),
+                  key=lambda p: p.name, reverse=True)
+
+
+def overlay_pending(work: Path, session_id: str) -> list[Path]:
+    """Apply a session's own pending sets to a working memory copy (resume)."""
+    used = []
+    for s in reversed(pending_sets()):                  # oldest first
+        meta = read_json(s / "meta.json", {}) or {}
+        if session_id not in (meta.get("sessions") or []):
+            continue
+        for rel in (read_json(s / "base.json", {}) or {}):
+            src = s / "files" / rel
+            if src.is_file():
+                (work / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src, work / rel)
+        for rel in read_json(s / "deleted.json", []) or []:
+            (work / rel).unlink(missing_ok=True)
+        used.append(s)
+    return used
+
+
+def save_pending(run: Path, meta: dict, sessions: list[str]):
+    """Keep what a session changed in memory, for review; approved memory is untouched."""
+    base = read_json(run / "memory-base.json", {}) or {}
+    now = tree_hashes(run / "memory")
+    changed = {rel: base.get(rel) for rel, h in now.items() if base.get(rel) != h}
+    deleted = sorted(rel for rel in base if rel not in now)
+    superseded = [PENDING / n for n in meta.get("overlaid_sets", [])]
+    if not changed and not deleted:
+        for s in superseded:
+            shutil.rmtree(s, ignore_errors=True)
+        return None
+    dest = PENDING / run.name
+    (dest / "files").mkdir(parents=True, exist_ok=True)
+    for rel in changed:
+        (dest / "files" / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(run / "memory" / rel, dest / "files" / rel)
+    write_json(dest / "base.json", changed)
+    write_json(dest / "deleted.json", deleted)
+    write_json(dest / "meta.json", {
+        "run": run.name, "created": time.strftime("%Y-%m-%d %H:%M"),
+        "workspace": meta.get("workspace"), "brief": meta.get("brief_src"),
+        "sessions": sessions, "resume_of": meta.get("resume_of")})
+    for s in superseded:
+        if s != dest:
+            shutil.rmtree(s, ignore_errors=True)
+    return dest
+
+
+def _show_diff(old: Path | None, new: Path | None, rel: str):
+    import difflib
+    a = old.read_text(encoding="utf-8", errors="replace").splitlines() if old and old.is_file() else []
+    b = new.read_text(encoding="utf-8", errors="replace").splitlines() if new and new.is_file() else []
+    for line in difflib.unified_diff(a, b, f"approved/{rel}", f"session/{rel}", lineterm=""):
+        say(line)
+
+
+def cmd_memory():
+    sets = pending_sets()
+    if not sets:
+        say("No memory changes are waiting for review.")
+        return 0
+    say(f"Memory changes from Docker sessions, waiting for review ({len(sets)}):")
+    for i, s in enumerate(sets, 1):
+        meta = read_json(s / "meta.json", {}) or {}
+        n = len(read_json(s / "base.json", {}) or {}) + len(read_json(s / "deleted.json", []) or [])
+        topic = ""
+        m = re.search(r"/topics/([^/]+)/", meta.get("brief") or "")
+        if m:
+            topic = f", topic {m.group(1)}"
+        say(f"  {i}. {meta.get('created', s.name)} — {n} file(s){topic}"
+            f"{' (resumed session)' if meta.get('resume_of') else ''}")
+    if not sys.stdin.isatty():
+        say("\nRun claude-classifier-docker --memory in a terminal to review them.")
+        return 0
+    while True:
+        choice = input("\nOpen which one? (number; Enter to stop) ").strip()
+        if not choice:
+            return 0
+        if not choice.isdigit() or not 1 <= int(choice) <= len(sets):
+            say("  Not a number from the list.")
+            continue
+        _review_set(sets[int(choice) - 1])
+        sets = pending_sets()
+        if not sets:
+            say("Nothing left to review.")
+            return 0
+
+
+def _review_set(s: Path):
+    base = read_json(s / "base.json", {}) or {}
+    deleted = read_json(s / "deleted.json", []) or []
+    for rel in base:
+        say(f"\n=== {rel} ({'new' if base[rel] is None else 'changed'}) ===")
+        _show_diff(APPROVED_MEMORY / rel, s / "files" / rel, rel)
+    for rel in deleted:
+        say(f"\n=== {rel} (deleted by the session) ===")
+    ans = input("\n[a]pprove all, [f]ile by file, [d]iscard all, [s]kip for now? ").strip().lower()
+    if ans.startswith("s") or not ans:
+        return
+    if ans.startswith("d"):
+        shutil.rmtree(s, ignore_errors=True)
+        say("Discarded; approved memory is unchanged.")
+        return
+    by_file = ans.startswith("f")
+    for rel, base_hash in base.items():
+        if by_file and input(f"Approve {rel}? [y/N] ").strip().lower() != "y":
+            continue
+        _apply_file(s, rel, base_hash)
+    for rel in deleted:
+        if by_file and input(f"Approve deleting {rel}? [y/N] ").strip().lower() != "y":
+            continue
+        target = APPROVED_MEMORY / rel
+        if target.is_file():
+            target.unlink()
+    shutil.rmtree(s, ignore_errors=True)
+    say("Done; the next session loads the approved memory.")
+
+
+def _apply_file(s: Path, rel: str, base_hash):
+    target = APPROVED_MEMORY / rel
+    now_hash = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else None
+    if now_hash != base_hash:
+        say(f"\n{rel} changed in approved memory since this session started "
+            "(another review approved a change). Both versions:")
+        _show_diff(target, s / "files" / rel, rel)
+        ans = input("[k]eep the approved one, [t]ake the session's? ").strip().lower()
+        if not ans.startswith("t"):
+            return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(s / "files" / rel, target)
+
+
+# ─────────────────────────────── sessions ──────────────────────────────────
+def load_sessions() -> dict:
+    d = read_json(SESSIONS, {}) or {}
+    d.setdefault("runs", {})
+    d.setdefault("sessions", {})
+    return d
+
+
+def transcripts_since(t0: float) -> list[str]:
+    if not HOST_PROJECTS.is_dir():
+        return []
+    return [p.stem for p in sorted(HOST_PROJECTS.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+            if p.stat().st_mtime >= t0 - 1]
+
+
+def newest_session():
+    files = sorted(HOST_PROJECTS.glob("*.jsonl"), key=lambda p: p.stat().st_mtime) \
+        if HOST_PROJECTS.is_dir() else []
+    return files[-1].stem if files else None
+
+
+def choose_session():
+    files = sorted(HOST_PROJECTS.glob("*.jsonl"), key=lambda p: p.stat().st_mtime,
+                   reverse=True)[:15] if HOST_PROJECTS.is_dir() else []
+    if not files:
+        raise Refused("there are no Docker sessions to resume.")
+    reg = load_sessions()
+    say("Recent Docker sessions:")
+    for i, p in enumerate(files, 1):
+        run = reg["runs"].get(reg["sessions"].get(p.stem, ""), {})
+        m = re.search(r"/topics/([^/]+)/", run.get("brief_src") or "")
+        what = f"topic {m.group(1)}" if m else (run.get("workspace") or "")
+        say(f"  {i}. {time.strftime('%Y-%m-%d %H:%M', time.localtime(p.stat().st_mtime))}"
+            f"  {p.stem[:8]}  {what}")
+    if not sys.stdin.isatty():
+        raise Refused("name one: claude-classifier-docker --resume ID")
+    c = input("Resume which one? (number) ").strip()
+    if not c.isdigit() or not 1 <= int(c) <= len(files):
+        raise Refused("no session chosen.")
+    return files[int(c) - 1].stem
+
+
+# ─────────────────────────────── the launch ────────────────────────────────
+def reap_stale():
+    """Remove containers, networks and run folders whose session has ended."""
+    RUNS.mkdir(parents=True, exist_ok=True)
+    for run in RUNS.iterdir():
+        pid = 0
+        try:
+            pid = int((run / "runner.pid").read_text().strip())
+        except (OSError, ValueError):
+            pass
+        started = (run / "meta.json").is_file()
+        # a run folder younger than a minute with no runner yet is being launched
+        young = time.time() - run.stat().st_mtime < 60
+        if (pid and pid_alive(pid)) or (not pid and young):
+            continue
+        if started:
+            finish_run(run.name, quiet=True)
+        else:
+            rmtree(run)
+    r = docker("ps", "-a", "--filter", f"label={LABEL}", "--format",
+               "{{.Names}}\t{{.Label \"" + LABEL + "\"}}")
+    for line in (r.stdout or "").splitlines():
+        name, _, rid = line.partition("\t")
+        if rid and not (RUNS / rid).exists():
+            docker("rm", "-f", name)
+    r = docker("network", "ls", "--filter", f"label={LABEL}", "--format",
+               "{{.Name}}\t{{.Label \"" + LABEL + "\"}}")
+    for line in (r.stdout or "").splitlines():
+        name, _, rid = line.partition("\t")
+        if rid and not (RUNS / rid).exists():
+            docker("network", "rm", name)
+
+
+def hosts_file(run: Path) -> Path:
+    """Rebuild the proxy's combined allow-list for this run."""
+    hosts = []
+    for h in ANTHROPIC_HOSTS + list_lines(ALLOWED_HOSTS) + list_lines(run / "proxy" / "extra-hosts.txt"):
+        h = h.lower()
+        if HOST_RE.match(h) and h not in hosts:
+            hosts.append(h)
+    f = run / "proxy" / "hosts" / "hosts.txt"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_name("hosts.txt.tmp")
+    tmp.write_text("\n".join(hosts) + "\n", encoding="utf-8")
+    os.replace(tmp, f)
+    return f
+
+
+def system_note(writes, prompt_mode) -> str:
+    w = ", ".join(inner for _, inner in writes) or "none"
+    return (
+        "## This session runs in claude-classifier-docker (a locked-down container)\n\n"
+        "- Network access goes through an allow-list proxy: only Anthropic and hosts "
+        "the person approved are reachable. If a web fetch or command fails with "
+        "HTTP 403, \"CONNECT tunnel failed\" or \"Forbidden\", tell the person which "
+        "host was refused and that they can allow it ON THEIR MACHINE (not from here) "
+        "with `claude-classifier-docker --allow HOST` (this session) or `claude-classifier-docker --allow "
+        "HOST --keep` (future sessions too). Retry once they say it is done. Do not "
+        "look for another way out.\n"
+        f"- /workspace is read-only. Writable: {w}. Some credential-looking files "
+        "appear empty on purpose.\n"
+        "- What you write to memory is held for the person's review; later sessions "
+        "see it only once they approve it.\n")
+
+
+def prepare(args, *, resume=None, command=None, tty=True) -> tuple[str, dict]:
+    """Everything before the container starts. Returns (run id, meta)."""
+    ws = resolve_workspace(args.workspace)
+    writes = resolve_writes(ws, args.write)
+    extra_hosts = []
+    for h in args.allow_host or []:
+        if not HOST_RE.match(h.lower()):
+            raise Refused(f"--allow-host {h}: not a host name")
+        extra_hosts.append(h.lower())
+    inputs = {}
+    for flag, key in (("prompt_file", "prompt"), ("brief_file", "brief"),
+                      ("settings_file", "settings")):
+        v = getattr(args, flag)
+        if v:
+            p = Path(v).expanduser()
+            if not p.is_file():
+                raise Refused(f"no such file for --{flag.replace('_', '-')}: {v}")
+            inputs[key] = p.resolve()
+    if "settings" in inputs and read_json(inputs["settings"]) is None:
+        raise Refused(f"--settings-file is not valid JSON: {inputs['settings']}")
+    policy_check()
+    model, model_from = pick_model(args.model)
+
+    run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+    run = RUNS / run_id
+    for d in ("config", "in", "proxy/hosts", "memory", "emptydir"):
+        (run / d).mkdir(parents=True, exist_ok=True)
+    os.chmod(run, 0o700)
+    (run / "empty").write_bytes(b"")
+
+    # the container's own login and a sanitised .claude.json; nothing else carries over
+    if CREDS.is_file():
+        shutil.copyfile(CREDS, run / "config" / ".credentials.json")
+        os.chmod(run / "config" / ".credentials.json", 0o600)
+    write_json(run / "config" / ".claude.json", sanitise_claude_json(read_json(CLAUDE_JSON)))
+    # Mount points are made here, as you: a mount point Docker has to create
+    # itself is created as root, and the run folder could then not be removed.
+    (run / "config" / "settings.json").write_text("{}\n", encoding="utf-8")
+    (run / "config" / "projects" / "-workspace").mkdir(parents=True, exist_ok=True)
+    HOST_PROJECTS.mkdir(parents=True, exist_ok=True)
+    APPROVED_MEMORY.mkdir(parents=True, exist_ok=True)
+
+    # memory: a working copy of the approved memory; the base shows what changed
+    shutil.copytree(APPROVED_MEMORY, run / "memory", dirs_exist_ok=True)
+    write_json(run / "memory-base.json", tree_hashes(run / "memory"))
+    overlaid = overlay_pending(run / "memory", resume) if resume else []
+
+    # inputs, snapshotted read-only
+    for key, p in inputs.items():
+        shutil.copyfile(p, run / "in" / ("settings.json" if key == "settings" else f"{key}.md"))
+    note = system_note(writes, "prompt" in inputs)
+    brief_text = (run / "in" / "brief.md").read_text(encoding="utf-8") if "brief" in inputs else ""
+    (run / "in" / "system-append.md").write_text(
+        (brief_text + "\n\n" if brief_text else "") + note, encoding="utf-8")
+
+    # the proxy's allow-list
+    (run / "proxy" / "extra-hosts.txt").write_text(
+        "".join(h + "\n" for h in extra_hosts), encoding="utf-8")
+    hosts_file(run)
+    logs = CACHE / "proxy-logs" / run_id
+    logs.mkdir(parents=True, exist_ok=True)
+
+    masks = find_masks(ws)
+    meta = {
+        "run": run_id, "workspace": str(ws), "writes": [str(p) for p, _ in writes],
+        "allow_hosts": extra_hosts, "model": model, "model_from": model_from,
+        "brief_src": str(inputs.get("brief", "")) or None,
+        "prompt_src": str(inputs.get("prompt", "")) or None,
+        "settings_src": str(inputs.get("settings", "")) or None,
+        "started": time.time(), "resume_of": resume, "overlaid_sets": [s.name for s in overlaid],
+        "gui": bool(args.gui), "shell": bool(args.shell), "masks": masks,
+    }
+    write_json(run / "meta.json", meta)
+
+    try:
+        return _start_proxy_and_args(args, run_id, run, meta, ws, writes, inputs, masks,
+                                     model, model_from, extra_hosts, logs, resume, command, tty)
+    except BaseException:
+        finish_run(run_id, quiet=True)
+        raise
+
+
+def _start_proxy_and_args(args, run_id, run, meta, ws, writes, inputs, masks, model,
+                          model_from, extra_hosts, logs, resume, command, tty):
+    # the network: internal, and no address on the host side (isolated gateway)
+    net = f"claude-classifier-docker-int-{run_id}"
+    r = docker("network", "create", "--internal", "-o",
+               "com.docker.network.bridge.gateway_mode_ipv4=isolated",
+               "--label", f"{LABEL}={run_id}", net)
+    if r.returncode != 0:
+        raise Refused(f"could not create the session network: {r.stderr.strip()}")
+    proxy = f"claude-classifier-docker-proxy-{run_id}"
+    r = docker("run", "-d", "--rm", "--name", proxy, "--label", f"{LABEL}={run_id}",
+               "--network", "bridge", "--user", "1000:1000", "--cap-drop", "ALL",
+               "--security-opt", "no-new-privileges", "--read-only",
+               "--tmpfs", "/tmp:size=64m,uid=1000,gid=1000", "--memory", "256m",
+               "--pids-limit", "128",
+               "-v", f"{SQUID_CONF}:/etc/squid-cd/squid.conf:ro",
+               "-v", f"{run / 'proxy' / 'hosts'}:/etc/squid-cd/hosts:ro",
+               "-v", f"{logs}:/var/log/squid-cd", PROXY_IMAGE)
+    if r.returncode != 0:
+        raise Refused(f"could not start the network proxy: {r.stderr.strip()}")
+    r = docker("network", "connect", net, proxy)
+    if r.returncode != 0:
+        raise Refused(f"could not attach the proxy to the session network: {r.stderr.strip()}")
+    ip = docker("inspect", "-f", "{{(index .NetworkSettings.Networks \"" + net + "\").IPAddress}}",
+                proxy).stdout.strip()
+    if not ip:
+        raise Refused("could not find the proxy's address on the session network.")
+    for _ in range(100):                              # squid is up when it says so
+        try:
+            if "Accepting HTTP" in (logs / "cache.log").read_text(errors="replace"):
+                break
+        except OSError:
+            pass
+        if docker("inspect", "-f", "{{.State.Running}}", proxy).stdout.strip() != "true":
+            raise Refused("the network proxy stopped while starting; see "
+                          f"{logs / 'cache.log'}")
+        time.sleep(0.1)
+    else:
+        raise Refused(f"the network proxy did not start; see {logs / 'cache.log'}")
+
+    purl = f"http://{ip}:3128"
+    dargs = ["run", "--rm", "--name", f"claude-classifier-docker-{run_id}", "--label", f"{LABEL}={run_id}",
+             "--network", net, "--init", "--read-only",
+             "--tmpfs", "/tmp:size=1g,mode=1777",
+             "--tmpfs", "/home/node:size=512m,uid=1000,gid=1000,mode=0700",
+             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+             "--shm-size", "64m", "--pids-limit", "512", "--memory", "4g",
+             "-e", f"HTTPS_PROXY={purl}", "-e", f"https_proxy={purl}",
+             "-e", f"HTTP_PROXY={purl}", "-e", f"http_proxy={purl}",
+             "-e", "NO_PROXY=", "-e", "no_proxy=",
+             "-e", f"ANTHROPIC_MODEL={model}", "-e", "LANG=C.UTF-8", "-e", "LC_ALL=C.UTF-8",
+             # Claude Code's own background calls, off: the official plugin
+             # marketplace clone (github.com) and update checks. Then a github.com
+             # refusal always means the session itself tried to reach GitHub.
+             "-e", "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1",
+             "-e", "DISABLE_UPDATES=1",
+             "-v", f"{run / 'config'}:/home/node/.claude",
+             "-v", f"{CONTAINER_SETTINGS}:/home/node/.claude/settings.json:ro",
+             "-v", f"{HOST_PROJECTS}:/home/node/.claude/projects/-workspace",
+             "-v", f"{run / 'memory'}:/home/node/.claude/projects/-workspace/memory",
+             "-v", f"{POLICY_DIR}:/etc/claude-code:ro",
+             "-v", f"{run / 'in'}:/opt/claude-docker/in:ro",
+             "-v", f"{ws}:/workspace:ro"]
+    if tty:
+        dargs[1:1] = ["-it"]
+    else:
+        dargs[1:1] = ["-i"]
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        dargs += ["-e", "ANTHROPIC_API_KEY"]
+    for real, inner in writes:
+        dargs += ["-v", f"{real}:{inner}"]
+    for rel, is_dir in masks:
+        dargs += ["-v", f"{run / ('emptydir' if is_dir else 'empty')}:/workspace/{rel}:ro"]
+    dargs.append(IMAGE)
+
+    if command:
+        inner = command
+    elif args.shell:
+        inner = ["bash"]
+    else:
+        inner = ["claude", "--append-system-prompt-file", "/opt/claude-docker/in/system-append.md"]
+        if "settings" in inputs:
+            inner += ["--settings", "/opt/claude-docker/in/settings.json"]
+        if resume:
+            inner += ["--resume", resume]
+        elif "brief" in inputs:
+            inner.append(
+                "Please start. Your instructions for this session were given to you "
+                "separately, so they are not shown in this window; they are in "
+                "/opt/claude-docker/in/brief.md. In your first message, tell me in one "
+                "line that I can ask to see them, in full or as a summary. If I do, put "
+                "them in your reply itself: a file you only read is not shown to me here.")
+        elif "prompt" in inputs:
+            inner.append((run / "in" / "prompt.md").read_text(encoding="utf-8"))
+    dargs += inner
+    write_json(run / "docker-args.json", dargs)
+
+    say(f"claude-classifier-docker: model {model} ({model_from})")
+    wtxt = ", ".join(i.replace("/workspace", ".", 1) if i != "/workspace" else "all"
+                     for _, i in writes)
+    say(f"claude-classifier-docker: workspace {ws} (read-only{'; writable: ' + wtxt if wtxt else ''})")
+    if masks:
+        say("claude-classifier-docker: hidden from Claude: " + ", ".join(m for m, _ in masks))
+    if extra_hosts:
+        say("claude-classifier-docker: also allowed for this launch: " + ", ".join(extra_hosts))
+    n = len(pending_sets())
+    if n:
+        say(f"claude-classifier-docker: {n} session(s)' memory changes await review: claude-classifier-docker --memory")
+    last = CACHE / "last-refused.txt"
+    if last.is_file() and last.read_text().strip():
+        say("claude-classifier-docker: the last session was refused these hosts: "
+            + last.read_text().strip().replace("\n", ", ")
+            + " (allow one with: claude-classifier-docker --allow HOST --keep)")
+        last.unlink()
+    return run_id, meta
+
+
+def refused_hosts(run_id) -> list[str]:
+    out = []
+    try:
+        for line in (CACHE / "proxy-logs" / run_id / "access.log").read_text(errors="replace").splitlines():
+            if "TCP_DENIED" in line:
+                target = line.split()[-1]
+                host = target.rsplit(":", 1)[0] if ":" in target else target
+                if host not in out:
+                    out.append(host)
+    except OSError:
+        pass
+    return out
+
+
+def finish_run(run_id, quiet=False):
+    """Stop the containers, keep the login and memory changes, remove the run folder."""
+    run = RUNS / run_id
+    docker("rm", "-f", f"claude-classifier-docker-{run_id}", f"claude-classifier-docker-proxy-{run_id}")
+    docker("network", "rm", f"claude-classifier-docker-int-{run_id}")
+    meta = read_json(run / "meta.json", {}) or {}
+    cf = run / "config" / ".credentials.json"
+    if cf.is_file() and read_json(cf) is not None and cred_expiry(cf) >= cred_expiry(CREDS):
+        DATA.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(cf, CREDS)
+        os.chmod(CREDS, 0o600)
+    cj = read_json(run / "config" / ".claude.json")
+    if isinstance(cj, dict):
+        write_json(CLAUDE_JSON, sanitise_claude_json(cj))
+    sessions = transcripts_since(meta.get("started", time.time())) if meta else []
+    if meta.get("resume_of") and meta["resume_of"] not in sessions:
+        sessions.append(meta["resume_of"])
+    pend = save_pending(run, meta, sessions) if (run / "memory").is_dir() else None
+    if meta and not meta.get("selftest"):
+        reg = load_sessions()
+        reg["runs"][run_id] = {k: meta.get(k) for k in (
+            "workspace", "writes", "allow_hosts", "model", "brief_src", "prompt_src",
+            "settings_src", "gui", "shell")}
+        for sid in sessions:
+            reg["sessions"][sid] = run_id
+        write_json(SESSIONS, reg)
+        if (run / "in").is_dir() and sessions:
+            dest = INPUTS / run_id
+            shutil.copytree(run / "in", dest, dirs_exist_ok=True)
+    refused = [h for h in refused_hosts(run_id) if h not in CLAUDE_BACKGROUND_HOSTS]
+    if refused and not meta.get("selftest"):
+        (CACHE / "last-refused.txt").write_text("\n".join(refused) + "\n", encoding="utf-8")
+    rmtree(run)
+    if not quiet:
+        if refused:
+            say("claude-classifier-docker: this session was refused: " + ", ".join(refused))
+            say("  allow one for good with: claude-classifier-docker --allow HOST --keep")
+        if pend:
+            say("claude-classifier-docker: this session changed memory; review with: claude-classifier-docker --memory")
+
+
+def run_session(run_id) -> int:
+    """Run the container in this terminal and clean up however it ends."""
+    run = RUNS / run_id
+    (run / "runner.pid").write_text(f"{os.getpid()}\n")
+    dargs = read_json(run / "docker-args.json")
+    meta = read_json(run / "meta.json", {}) or {}
+    log = CACHE / "sessions" / f"{run_id}.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    proc = None
+    hung_up = threading.Event()
+
+    def on_hup(signum, frame):
+        hung_up.set()
+        # the window is gone: nothing can be printed any more
+        try:
+            fd = os.open(str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+        except OSError:
+            pass
+        if proc and proc.poll() is None:
+            proc.terminate()
+
+    signal.signal(signal.SIGHUP, on_hup)
+    signal.signal(signal.SIGTERM, on_hup)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)       # Ctrl+C belongs to Claude
+    rc = 1
+    try:
+        # Create, then start attached, rather than `docker run`: the create step
+        # is where Docker prints its warnings (on WSL, "Your kernel does not
+        # support swap limit capabilities…" for the 4 GB memory cap, which still
+        # applies). They go to the session log instead of the top of the window.
+        name = dargs[dargs.index("--name") + 1]
+        made = subprocess.run(["docker", "create", *dargs[1:]], text=True,
+                              capture_output=True)
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(made.stderr)
+        if made.returncode != 0:
+            say(f"claude-classifier-docker: the session could not start:\n{made.stderr.strip()}", err=True)
+            rc = made.returncode
+        else:
+            proc = subprocess.Popen(["docker", "start", "--attach", "--interactive", name])
+            rc = proc.wait()
+    finally:
+        finish_run(run_id, quiet=hung_up.is_set())
+    if meta.get("gui") and not hung_up.is_set() and rc not in (0, 130):
+        try:
+            input(f"\nclaude-classifier-docker: the session ended with an error ({rc}). Press Enter to close. ")
+        except (EOFError, OSError):
+            pass
+    return rc
+
+
+XTERM_RESOURCES = [
+    "XTerm*allowTitleOps: false", "XTerm*allowWindowOps: false",
+    "XTerm*allowFontOps: false", "XTerm*allowTcapOps: false",
+    "XTerm*allowSendEvents: false", "XTerm*allowPasteControls: false",
+    "XTerm*disallowedWindowOps: 1,2,3,4,5,6,7,8,9,11,13,14,18,19,20,21,GetSelection,SetSelection,SetWinLines,SetXprop",
+    # What YOU select or copy reaches the clipboard (selectToClipboard,
+    # Ctrl+Shift+C/V); a PROGRAM setting it by escape code (OSC 52) stays blocked
+    # by allowWindowOps/disallowedWindowOps above.
+    "XTerm*selectToClipboard: true",
+    "XTerm*VT100.translations: #override \\n"
+    "    Shift Ctrl <Key>C: copy-selection(CLIPBOARD) \\n"
+    "    Shift Ctrl <Key>V: insert-selection(CLIPBOARD) \\n"
+    "    Shift <Key>Insert: insert-selection(CLIPBOARD) \\n"
+    "    <Btn3Down>: insert-selection(CLIPBOARD)",
+    "XTerm*pointerColor: white", "XTerm*pointerColorBackground: black", "XTerm*pointerMode: 0",
+]
+
+
+XTERM_CLASS = "classifier"
+
+
+def xterm_argv(title, command):
+    # Linux version: -class (not just -name) so GNOME Shell's WM_CLASS match hits
+    # classifier.desktop (and the ZIS icon) instead of the stock
+    # debian-xterm.desktop. -class renames the resource class, so every XTerm*
+    # resource is also given under the new class or the lockdown would not apply.
+    argv = ["xterm", "-name", XTERM_CLASS, "-class", XTERM_CLASS, "-title", title]
+    for r in XTERM_RESOURCES:
+        argv += ["-xrm", r, "-xrm", XTERM_CLASS + r[len("XTerm"):]]
+    return argv + ["-u8", "-fa", "DejaVu Sans Mono", "-fs", "11", "-bg", "#1e1e1e",
+                   "-fg", "#d4d4d4", "-geometry", "120x36", "-e", *command]
+
+
+def show_error_window(msg):
+    """Under --gui with nobody watching the output (ZIS), a refusal must be seen."""
+    if sys.stderr.isatty() or not os.environ.get("DISPLAY") or not shutil.which("xterm"):
+        return
+    script = 'printf "%s\\n\\n" "$1"; printf "Press Enter to close. "; read x'
+    subprocess.Popen(xterm_argv("claude-classifier-docker — could not start",
+                                ["sh", "-c", script, "sh", "claude-classifier-docker could not start:\n\n" + msg]),
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+# ───────────────────── the window: menus above the terminal ─────────────────────
+# `--gui` opens a Qt window titled "Claude window" with a menu bar (Session,
+# Review, Help) and the xterm embedded below it (`xterm -into`). Qt runs on X11
+# (QT_QPA_PLATFORM=xcb) so the xterm can live inside it. Everything here runs on
+# this machine, outside the container: nothing in the session can press these
+# menus. The one thing shown here that comes from inside is the name of a host
+# the proxy refused, so every such name is shown as plain text, never a link,
+# and is allowed only by a click.
+HELP_HTML = """
+<h2>claude-classifier-docker — this window</h2>
+<p>Claude runs here in a locked-down container. The menus above run on your
+machine, outside it; nothing inside the session can use them.</p>
+
+<h3>What the session can see and do</h3>
+<ul>
+<li><b>The launch folder</b> is at <code>/workspace</code>, <b>read-only</b>. Only
+folders named with <code>--write</code> can be changed (see <i>Help &gt; About this
+session</i>).</li>
+<li><b>Credential-looking files</b> in it (and those listed in
+<code>~/.config/claude-classifier-docker/hide.txt</code>) appear <b>empty</b>.</li>
+<li><b>Network:</b> only Anthropic and the hosts on your allow-list, through a
+proxy outside the container. No DNS, no route to this machine.</li>
+<li><b>Its own Claude config</b>, rebuilt fresh each session; never your
+<code>~/.claude</code>. Nothing a session plants carries into the next one.</li>
+<li><b>Memory</b> the session writes is <b>held for your review</b>; later sessions
+see it only once you approve it.</li>
+<li><b>A policy it cannot change:</b> prompts only (no auto or bypass mode), no
+hooks, no MCP servers, no claude.ai connectors, no artifacts.</li>
+</ul>
+
+<h3>The menus</h3>
+<table cellpadding="4" width="100%">
+<tr><td><b>Session &gt; Allow a host…</b></td><td>Let this session reach a host now, with
+no restart; tick <i>keep</i> to allow it in future sessions too.</td></tr>
+<tr><td><b>Review…</b></td><td>The allowed hosts, the hosts refused so far (with Allow
+buttons), the policy, and memory changes waiting for review.</td></tr>
+<tr><td><b>Help &gt; About this session</b></td><td>The launch folder, what is writable,
+what is hidden, the model.</td></tr>
+</table>
+
+<h3>Commands (in a terminal on this machine)</h3>
+<table cellpadding="4" width="100%">
+<tr><td><code>claude-classifier-docker</code></td><td>Claude in the terminal, on the local folder (where
+ZIS is installed)</td></tr>
+<tr><td><code>claude-classifier-docker --gui [DIR]</code></td><td>this window</td></tr>
+<tr><td><code>--write SUBDIR</code></td><td>make a subfolder of the launch folder writable
+(repeatable; <code>.</code> = all of it)</td></tr>
+<tr><td><code>--allow-host HOST</code></td><td>allow a host for this launch only</td></tr>
+<tr><td><code>claude-classifier-docker --allow HOST [--keep]</code></td><td>allow a host in the running
+sessions now; <code>--keep</code> saves it</td></tr>
+<tr><td><code>claude-classifier-docker --memory</code></td><td>review memory changes sessions have made</td></tr>
+<tr><td><code>claude-classifier-docker --policy [edit]</code></td><td>show, or edit with a check of what gets
+loosened, the policy</td></tr>
+<tr><td><code>claude-classifier-docker --continue</code></td><td>reopen the latest Docker session, with its
+launch settings</td></tr>
+<tr><td><code>claude-classifier-docker --resume [ID]</code></td><td>reopen a chosen session (a list if no
+ID)</td></tr>
+<tr><td><code>claude-classifier-docker --selftest</code></td><td>check each protection</td></tr>
+<tr><td><code>claude-classifier-docker --help</code></td><td>all of this, in the terminal</td></tr>
+</table>
+
+<h3>Copy and paste</h3>
+<p><b>Paste</b> from the clipboard with <b>Ctrl+Shift+V</b>, a
+<b>right-click</b>, <b>Shift+Insert</b>, or <i>Session &gt; Paste from the
+clipboard</i>. (Plain Ctrl+V does not paste text here.)</p>
+<p><b>Copy</b>: select with the mouse (hold <b>Shift</b> while dragging if Claude
+is using the mouse); the selection goes to the clipboard, and
+<b>Ctrl+Shift+C</b> copies it again. Programs inside the session cannot set
+your clipboard.</p>
+
+<h3>When Claude says a host was refused</h3>
+<p>Decide whether you want the session to reach it. If so, use <i>Review &gt; Refused
+so far</i> (or <i>Session &gt; Allow a host…</i>) and tell Claude to try again. A
+request for a host is not by itself a reason to allow it.</p>
+"""
+
+
+def has_pyqt6() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("PyQt6") is not None
+
+
+def refused_counts(run_id) -> list[tuple[str, int]]:
+    counts = {}
+    try:
+        text = (CACHE / "proxy-logs" / run_id / "access.log").read_text(errors="replace")
+    except OSError:
+        return []
+    for line in text.splitlines():
+        if "TCP_DENIED" in line:
+            target = line.split()[-1]
+            host = target.rsplit(":", 1)[0] if ":" in target else target
+            counts[host] = counts.get(host, 0) + 1
+    return sorted(counts.items())
+
+
+def remove_saved_host(host) -> bool:
+    """Take a host off the saved list; running sessions lose it at once."""
+    h = host.lower()
+    try:
+        lines = ALLOWED_HOSTS.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    kept = [ln for ln in lines if ln.strip().lower() != h]
+    if len(kept) == len(lines):
+        return False
+    ALLOWED_HOSTS.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    for run in (RUNS.iterdir() if RUNS.is_dir() else []):
+        try:
+            pid = int((run / "runner.pid").read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if pid_alive(pid) and h not in list_lines(run / "proxy" / "extra-hosts.txt"):
+            hosts_file(run)
+            reload_proxy(run.name)
+    return True
+
+
+def run_window(run_id) -> int:
+    # CLAUDE_DOCKER_WINDOW_SHOTS=DIR renders the window and every dialog to PNGs
+    # off-screen and exits: a visual check that opens nothing on the desktop.
+    shots = os.environ.get("CLAUDE_DOCKER_WINDOW_SHOTS")
+    os.environ["QT_QPA_PLATFORM"] = "offscreen" if shots else "xcb"
+    import ctypes
+    from PyQt6.QtCore import QEvent, Qt, QTimer
+    from PyQt6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox,
+                                 QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                                 QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
+                                 QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
+
+    me = os.path.abspath(__file__)
+    run = RUNS / run_id
+    meta = read_json(run / "meta.json", {}) or {}
+
+    # Xlib, for the three things Qt cannot do to another program's window:
+    # find it, size it, and give it the keyboard.
+    x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+                               ctypes.POINTER(ctypes.c_ulong),
+                               ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
+                               ctypes.POINTER(ctypes.c_uint)]
+    x11.XMoveResizeWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+    x11.XSetInputFocus.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    x11.XGetInputFocus.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong),
+                                   ctypes.POINTER(ctypes.c_int)]
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XFree.argtypes = [ctypes.c_void_p]
+    x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XKeysymToKeycode.restype = ctypes.c_ubyte
+    x11.XStringToKeysym.argtypes = [ctypes.c_char_p]
+    x11.XStringToKeysym.restype = ctypes.c_ulong
+    try:
+        xtst = ctypes.cdll.LoadLibrary("libXtst.so.6")
+        xtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int,
+                                           ctypes.c_ulong]
+    except OSError:
+        xtst = None
+    handler_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    ignore_errors = handler_t(lambda d, e: 0)     # a vanished xterm must not kill us
+    x11.XSetErrorHandler.argtypes = [handler_t]
+    x11.XSetErrorHandler(ignore_errors)
+    dpy = x11.XOpenDisplay(None)
+
+    def x_children(win):
+        root, parent = ctypes.c_ulong(), ctypes.c_ulong()
+        kids, n = ctypes.POINTER(ctypes.c_ulong)(), ctypes.c_uint()
+        if not dpy or not x11.XQueryTree(dpy, win, ctypes.byref(root), ctypes.byref(parent),
+                                         ctypes.byref(kids), ctypes.byref(n)):
+            return []
+        out = [kids[i] for i in range(n.value)]
+        if kids:
+            x11.XFree(kids)
+        return out
+
+    def x_focus():
+        w, r = ctypes.c_ulong(), ctypes.c_int()
+        x11.XGetInputFocus(dpy, ctypes.byref(w), ctypes.byref(r))
+        return w.value
+
+    def press(*names):
+        """Real key presses (XTest) into whatever has the X focus."""
+        codes = [x11.XKeysymToKeycode(dpy, x11.XStringToKeysym(n.encode())) for n in names]
+        for c in codes:
+            xtst.XTestFakeKeyEvent(dpy, c, 1, 0)
+        for c in reversed(codes):
+            xtst.XTestFakeKeyEvent(dpy, c, 0, 0)
+        x11.XFlush(dpy)
+
+    def plain(text):
+        lab = QLabel(text)
+        lab.setTextFormat(Qt.TextFormat.PlainText)
+        lab.setWordWrap(True)
+        return lab
+
+    def open_terminal(title, argv):
+        """A separate terminal for a flow that asks questions (policy edit, memory)."""
+        wrapped = ["bash", "-c", '"$@"; echo; read -r -p "Press Enter to close. " _', "x", *argv]
+        subprocess.Popen(xterm_argv(title, wrapped), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
+    class Host(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
+            self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors)
+            self.setStyleSheet("background:#1e1e1e")
+            self.term = None
+
+        def target(self):
+            inner = x_children(self.term) if self.term else []
+            return inner[0] if inner else self.term
+
+        def resizeEvent(self, e):
+            super().resizeEvent(e)
+            self.fit()
+
+        def fit(self):
+            if self.term and dpy:
+                r = self.devicePixelRatioF()
+                x11.XMoveResizeWindow(dpy, self.term, 0, 0, max(1, int(self.width() * r)),
+                                      max(1, int(self.height() * r)))
+                x11.XFlush(dpy)
+
+        def focus_term(self):
+            t = self.target()
+            if t and dpy:
+                x11.XSetInputFocus(dpy, t, 2, 0)            # RevertToParent
+                x11.XFlush(dpy)
+
+    class AllowDialog(QDialog):
+        def __init__(self, parent, host=""):
+            super().__init__(parent)
+            self.setWindowTitle("Allow a host")
+            self.setMinimumWidth(460)
+            lay = QVBoxLayout(self)
+            lay.addWidget(plain("Host name to allow (exact, e.g. www.tides.gc.ca). "
+                                "Every allowed host is a place data could be sent to."))
+            self.edit = QLineEdit(host)
+            lay.addWidget(self.edit)
+            self.keep = QCheckBox("Keep it for future sessions too")
+            lay.addWidget(self.keep)
+            bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                  | QDialogButtonBox.StandardButton.Cancel)
+            bb.accepted.connect(self.accept)
+            bb.rejected.connect(self.reject)
+            lay.addWidget(bb)
+
+    def do_allow(parent, host, keep):
+        h = host.strip().lower()
+        if not HOST_RE.match(h):
+            QMessageBox.warning(parent, "Not a host name",
+                                "That is not a host name (e.g. www.tides.gc.ca).")
+            return False
+        cmd_allow(h, keep)
+        QMessageBox.information(
+            parent, "Allowed",
+            f"{h} is allowed in this session now"
+            + (" and saved for future sessions." if keep else ".")
+            + "\n\nTell Claude to try again.")
+        return True
+
+    class Review(QDialog):
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.setWindowTitle("Review — claude-classifier-docker")
+            _fit(self, 640, 460)
+            lay = QVBoxLayout(self)
+            self.tabs = QTabWidget()
+            lay.addWidget(self.tabs)
+            self.tabs.addTab(self._hosts_tab(), "Allowed hosts")
+            self.tabs.addTab(self._refused_tab(), "Refused so far")
+            self.tabs.addTab(self._policy_tab(), "Policy")
+            self.tabs.addTab(self._memory_tab(), "Memory")
+            bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            bb.rejected.connect(self.reject)
+            lay.addWidget(bb)
+            self.timer = QTimer(self, interval=2000, timeout=self.refresh)
+            self.timer.start()
+            self.refresh()
+
+        # allowed hosts
+        def _hosts_tab(self):
+            w = QWidget(); v = QVBoxLayout(w)
+            v.addWidget(plain("Hosts this session can reach. The Anthropic hosts are always "
+                              "allowed: Claude Code needs them to work and to sign in."))
+            self.hosts = QListWidget(); v.addWidget(self.hosts)
+            row = QHBoxLayout()
+            for text, fn in (("Allow a host…", self._add), ("Remove from the saved list", self._remove),
+                             ("Keep for future sessions", self._keep)):
+                b = QPushButton(text); b.clicked.connect(fn); row.addWidget(b)
+            v.addLayout(row)
+            return w
+
+        def _fill_hosts(self):
+            cur = self.hosts.currentItem().data(Qt.ItemDataRole.UserRole) if self.hosts.currentItem() else None
+            self.hosts.clear()
+            extras = list_lines(run / "proxy" / "extra-hosts.txt")
+            rows = [(h, "always (Claude Code)", "fixed") for h in ANTHROPIC_HOSTS]
+            rows += [(h.lower(), "saved", "saved") for h in list_lines(ALLOWED_HOSTS)]
+            rows += [(h, "this session only", "session") for h in extras
+                     if h not in [r[0] for r in rows]]
+            for h, what, kind in rows:
+                it = QListWidgetItem(f"{h}    — {what}")
+                it.setData(Qt.ItemDataRole.UserRole, (h, kind))
+                if kind == "fixed":
+                    it.setFlags(Qt.ItemFlag.NoItemFlags)
+                self.hosts.addItem(it)
+                if cur and cur[0] == h:
+                    self.hosts.setCurrentItem(it)
+
+        def _selected(self, kind):
+            it = self.hosts.currentItem()
+            d = it.data(Qt.ItemDataRole.UserRole) if it else None
+            if not d or d[1] != kind:
+                QMessageBox.information(self, "Choose a host",
+                                        f"Select a {'saved' if kind == 'saved' else 'this-session'} host first.")
+                return None
+            return d[0]
+
+        def _add(self):
+            dlg = AllowDialog(self)
+            if dlg.exec():
+                do_allow(self, dlg.edit.text(), dlg.keep.isChecked())
+                self.refresh()
+
+        def _remove(self):
+            h = self._selected("saved")
+            if h and QMessageBox.question(
+                    self, "Remove host",
+                    f"Remove {h} from the saved list?\n\nRunning sessions lose it at once, "
+                    "and future sessions won't have it.") == QMessageBox.StandardButton.Yes:
+                remove_saved_host(h)
+                self.refresh()
+
+        def _keep(self):
+            h = self._selected("session")
+            if h:
+                cmd_allow(h, keep=True)
+                self.refresh()
+
+        # refused
+        def _refused_tab(self):
+            w = QWidget(); v = QVBoxLayout(w)
+            v.addWidget(plain("Hosts the proxy refused in this session. These names come from "
+                              "requests made INSIDE the container, so allow only hosts you "
+                              "recognise and want the session to reach."))
+            self.refused = QListWidget(); v.addWidget(self.refused)
+            row = QHBoxLayout()
+            b1 = QPushButton("Allow for this session"); b1.clicked.connect(lambda: self._allow_refused(False))
+            b2 = QPushButton("Allow and keep"); b2.clicked.connect(lambda: self._allow_refused(True))
+            row.addWidget(b1); row.addWidget(b2); v.addLayout(row)
+            return w
+
+        def _fill_refused(self):
+            cur = self.refused.currentItem().data(Qt.ItemDataRole.UserRole) if self.refused.currentItem() else None
+            allowed = set(ANTHROPIC_HOSTS) | {h.lower() for h in list_lines(ALLOWED_HOSTS)} \
+                | set(list_lines(run / "proxy" / "extra-hosts.txt"))
+            self.refused.clear()
+            for h, n in refused_counts(run_id):
+                note = "  (allowed since)" if h.lower() in allowed else ""
+                if h in CLAUDE_BACKGROUND_HOSTS:
+                    note += "  — Claude Code's own background check; normally leave blocked"
+                it = QListWidgetItem(f"{h}    — refused {n} time{'s' if n != 1 else ''}{note}")
+                it.setData(Qt.ItemDataRole.UserRole, h)
+                self.refused.addItem(it)
+                if cur == h:
+                    self.refused.setCurrentItem(it)
+            if not self.refused.count():
+                it = QListWidgetItem("(nothing refused so far)")
+                it.setFlags(Qt.ItemFlag.NoItemFlags)
+                self.refused.addItem(it)
+
+        def _allow_refused(self, keep):
+            it = self.refused.currentItem()
+            h = it.data(Qt.ItemDataRole.UserRole) if it else None
+            if not h:
+                QMessageBox.information(self, "Choose a host", "Select a refused host first.")
+                return
+            do_allow(self, h, keep)
+            self.refresh()
+
+        # policy
+        def _policy_tab(self):
+            w = QWidget(); v = QVBoxLayout(w)
+            v.addWidget(plain(f"The policy no session can change ({POLICY}):"))
+            self.policy = plain("")
+            v.addWidget(self.policy)
+            v.addStretch(1)
+            b = QPushButton("Edit the policy…")
+            b.clicked.connect(lambda: open_terminal("claude-classifier-docker — policy", [sys.executable, me, "--policy", "edit"]))
+            v.addWidget(b)
+            v.addWidget(plain("An edit is checked: anything it loosens is listed and must be "
+                              "confirmed. It applies from the next launch."))
+            return w
+
+        def _fill_policy(self):
+            data = read_json(POLICY)
+            if not isinstance(data, dict):
+                self.policy.setText("The policy file is missing or not valid JSON.")
+                return
+            text = "\n".join(policy_describe(data))
+            accepted = (list_lines(POLICY_ACCEPTED) or [""])[0]
+            if POLICY.is_file() and accepted and accepted != sha256(POLICY):
+                text += ("\n\nThe file changed since it was last accepted; launches are "
+                         "refused until it is reviewed with Edit the policy….")
+            self.policy.setText(text)
+
+        # memory
+        def _memory_tab(self):
+            w = QWidget(); v = QVBoxLayout(w)
+            v.addWidget(plain("Memory changes Docker sessions have made, waiting for you. Later "
+                              "sessions see a change only once you approve it. This session's "
+                              "own changes appear here after it ends."))
+            self.memory = QListWidget(); v.addWidget(self.memory)
+            b = QPushButton("Review memory changes…")
+            b.clicked.connect(lambda: open_terminal("claude-classifier-docker — memory", [sys.executable, me, "--memory"]))
+            v.addWidget(b)
+            return w
+
+        def _fill_memory(self):
+            self.memory.clear()
+            for s in pending_sets():
+                m = read_json(s / "meta.json", {}) or {}
+                n = len(read_json(s / "base.json", {}) or {}) + len(read_json(s / "deleted.json", []) or [])
+                topic = re.search(r"/topics/([^/]+)/", m.get("brief") or "")
+                self.memory.addItem(QListWidgetItem(
+                    f"{m.get('created', s.name)} — {n} file(s)"
+                    + (f", topic {topic.group(1)}" if topic else "")))
+            if not self.memory.count():
+                it = QListWidgetItem("(nothing waiting)")
+                it.setFlags(Qt.ItemFlag.NoItemFlags)
+                self.memory.addItem(it)
+
+        def refresh(self):
+            self._fill_hosts(); self._fill_refused(); self._fill_policy(); self._fill_memory()
+
+    class Win(QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle(TITLE)
+            self.host = Host()
+            self.setCentralWidget(self.host)
+            _fit(self, 1000, 660)
+            self.proc = None
+            ms = self.menuBar().addMenu("&Session")
+            ms.addAction("Paste from the clipboard", self.paste)
+            ms.addSeparator()
+            ms.addAction("Allow a host…", self.allow_host)
+            ms.addSeparator()
+            ms.addAction("End the session", self.close)
+            mr = self.menuBar().addMenu("&Review")
+            mr.addAction("Review hosts, policy and memory…", self.review)
+            mh = self.menuBar().addMenu("&Help")
+            mh.addAction("Help — this window and the commands…", self.help)
+            mh.addAction("About this session…", self.about)
+            self.status = QLabel()
+            self.status.setTextFormat(Qt.TextFormat.PlainText)
+            self.statusBar().addWidget(self.status, 1)
+            self.tick = QTimer(self, interval=2000, timeout=self.update_status)
+            self.last_refused = 0
+
+        def showEvent(self, e):
+            super().showEvent(e)
+            if self.proc is None and not shots and not getattr(self, '_starting', False):
+                self._starting = True
+                QTimer.singleShot(150, self.start)
+
+        def start(self):
+            argv = ["xterm", "-into", str(int(self.host.winId()))]
+            for r in XTERM_RESOURCES:
+                argv += ["-xrm", r]
+            argv += ["-u8", "-fa", "DejaVu Sans Mono", "-fs", "11", "-bg", "#1e1e1e",
+                     "-fg", "#d4d4d4", "-e", sys.executable, me, "--_run", run_id]
+            self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.finder = QTimer(self, interval=100, timeout=self.find_term)
+            self.finder.start()
+            self.watch = QTimer(self, interval=500, timeout=self.check_exit)
+            self.watch.start()
+            self.tick.start()
+            self.update_status()
+
+        def find_term(self):
+            kids = x_children(int(self.host.winId()))
+            if kids:
+                self.host.term = kids[0]
+                self.finder.stop()
+                self.host.fit()
+                self.host.focus_term()
+                self.keeper = QTimer(self, interval=250, timeout=self.keep_focus)
+                self.keeper.start()
+
+        def keep_focus(self):
+            """While this window is active and no menu or dialog is open, the
+            keyboard belongs to the terminal (WSLg hands it to no window otherwise)."""
+            if (self.isActiveWindow() and QApplication.activeModalWidget() is None
+                    and QApplication.activePopupWidget() is None
+                    and x_focus() != self.host.target()):
+                self.host.focus_term()
+
+        def check_exit(self):
+            if self.proc and self.proc.poll() is not None:
+                self.close()
+
+        def update_status(self):
+            ws = Path(meta.get("workspace") or "")
+            writes = [Path(w).relative_to(ws).as_posix() if ws and Path(w).is_relative_to(ws) else w
+                      for w in meta.get("writes") or []]
+            n = sum(c for h, c in refused_counts(run_id) if h not in CLAUDE_BACKGROUND_HOSTS)
+            parts = ["paste: Ctrl+Shift+V or right-click", f"{ws.name or ws} (read-only)",
+                     "writable: " + (", ".join(writes) if writes else "nothing"),
+                     f"refused so far: {n}" + (" — see Review" if n else "")]
+            self.status.setText("   ·   ".join(parts))
+
+        def paste(self):
+            """What Ctrl+Shift+V does, for anyone who would rather not remember it."""
+            if not (xtst and dpy and self.host.target()):
+                QMessageBox.information(self, "Paste",
+                                        "Click in the terminal and press Ctrl+Shift+V (or right-click).")
+                return
+            def go():
+                self.host.focus_term()
+                x11.XFlush(dpy)
+                QTimer.singleShot(80, lambda: press("Control_L", "Shift_L", "v"))
+            QTimer.singleShot(120, go)          # after the menu has closed
+
+        def allow_host(self):
+            dlg = AllowDialog(self)
+            if dlg.exec():
+                do_allow(self, dlg.edit.text(), dlg.keep.isChecked())
+            self.host.focus_term()
+
+        def review(self):
+            Review(self).exec()
+            self.host.focus_term()
+
+        def help(self):
+            self.help_dialog().exec()
+            self.host.focus_term()
+
+        def help_dialog(self):
+            d = QDialog(self)
+            d.setWindowTitle("Help — claude-classifier-docker")
+            _fit(d, 720, 620)
+            v = QVBoxLayout(d)
+            tb = QTextBrowser()
+            tb.setOpenLinks(False)
+            tb.setHtml(HELP_HTML)
+            v.addWidget(tb)
+            bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            bb.rejected.connect(d.reject)
+            v.addWidget(bb)
+            return d
+
+        def about(self):
+            self.about_box().exec()
+            self.host.focus_term()
+
+        def about_box(self):
+            ws = meta.get("workspace") or "?"
+            lines = [f"Launch folder (read-only at /workspace):\n  {ws}",
+                     "Writable:\n  " + ("\n  ".join(meta.get("writes") or []) or "nothing"),
+                     "Hidden from Claude (appear empty):\n  "
+                     + ("\n  ".join(m for m, _ in meta.get("masks") or []) or "nothing"),
+                     "Also allowed for this launch:\n  " + (", ".join(meta.get("allow_hosts") or []) or "nothing"),
+                     f"Model: {meta.get('model')} ({meta.get('model_from')})"]
+            if meta.get("resume_of"):
+                lines.append(f"Resumed session: {meta['resume_of']}")
+            if meta.get("brief_src"):
+                lines.append(f"Brief: {meta['brief_src']}")
+            box = QMessageBox(self)
+            box.setWindowTitle("About this session")
+            box.setTextFormat(Qt.TextFormat.PlainText)
+            box.setText("\n\n".join(lines))
+            return box
+
+        def event(self, e):
+            if e.type() == QEvent.Type.WindowActivate:
+                QTimer.singleShot(0, self.host.focus_term)
+            return super().event(e)
+
+        def closeEvent(self, e):
+            # ending the xterm ends the session: its runner gets HUP and cleans up
+            if self.proc and self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+            super().closeEvent(e)
+
+    # Linux version: GNOME Shell takes a window's dash/taskbar/Alt-Tab icon ONLY
+    # from the installed .desktop its WM_CLASS / app id matches (setWindowIcon is
+    # ignored there), so name this window classifier before Qt starts;
+    # zis/make-desktop-files.py installs classifier.desktop + its icon.
+    os.environ.setdefault("RESOURCE_NAME", "classifier")
+    app = QApplication([sys.argv[0]])
+    app.setApplicationName("claude-classifier-docker")
+    app.setDesktopFileName("classifier")
+    from PyQt6.QtGui import QIcon
+    app.setWindowIcon(QIcon.fromTheme("classifier"))
+    w = Win()
+    w.show()
+    if shots:
+        out = Path(shots)
+        out.mkdir(parents=True, exist_ok=True)
+
+        def take():
+            w.update_status()
+            w.grab().save(str(out / "0-window.png"))
+            r = Review(w)
+            r.show()
+            for i in range(r.tabs.count()):
+                r.tabs.setCurrentIndex(i)
+                app.processEvents()
+                r.grab().save(str(out / f"1-review-{i}.png"))
+            h = w.help_dialog(); h.show(); app.processEvents()
+            h.grab().save(str(out / "2-help.png"))
+            a = w.about_box(); a.show(); app.processEvents()
+            a.grab().save(str(out / "3-about.png"))
+            d = AllowDialog(w); d.show(); app.processEvents()
+            d.grab().save(str(out / "4-allow.png"))
+            app.quit()
+        QTimer.singleShot(300, take)
+    return app.exec()
+
+
+def validate(args):
+    """The checks that need no Docker, first: a refused folder, a bad --write
+    or a changed policy must not wait behind (or trigger) the Docker password
+    prompt."""
+    ws = resolve_workspace(args.workspace)
+    resolve_writes(ws, args.write)
+    for flag in ("prompt_file", "brief_file", "settings_file"):
+        v = getattr(args, flag)
+        if v and not Path(v).expanduser().is_file():
+            raise Refused(f"no such file for --{flag.replace('_', '-')}: {v}")
+    for h in args.allow_host or []:
+        if not HOST_RE.match(h.lower()):
+            raise Refused(f"--allow-host {h}: not a host name")
+    policy_check()
+    pick_model(args.model)
+
+
+def cmd_launch(args, resume=None) -> int:
+    validate(args)
+    ensure_docker()
+    reap_stale()
+    build_images(bool(args.upgrade))
+    version_notice()
+    run_id, meta = prepare(args, resume=resume)
+    if args.gui:
+        if not shutil.which("xterm"):
+            finish_run(run_id, quiet=True)
+            raise Refused("xterm is not installed on this machine (sudo apt-get install xterm).")
+        me = os.path.abspath(__file__)
+        quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+        def wait_runner(proc):
+            for _ in range(150):                 # the window's runner takes over
+                if (RUNS / run_id / "runner.pid").exists():
+                    return True
+                if proc.poll() is not None:
+                    return False
+                time.sleep(0.1)
+            return True
+        menus = os.environ.get("CLAUDE_DOCKER_WINDOW", "menus") != "xterm" and has_pyqt6()
+        if menus:
+            wlog = CACHE / "sessions" / f"{run_id}-window.log"
+            wlog.parent.mkdir(parents=True, exist_ok=True)
+            with open(wlog, "w", encoding="utf-8") as fh:
+                win = subprocess.Popen([sys.executable, me, "--_window", run_id],
+                                       env=dict(os.environ, QT_QPA_PLATFORM="xcb"),
+                                       stdin=subprocess.DEVNULL, stdout=fh, stderr=fh,
+                                       start_new_session=True)
+            if not wait_runner(win):
+                say("claude-classifier-docker: the window with menus could not open; using a plain "
+                    "terminal window instead.", err=True)
+                menus = False
+        if not menus:
+            term = subprocess.Popen(xterm_argv(TITLE, [sys.executable, me, "--_run", run_id]),
+                                    **quiet)
+            if not wait_runner(term):
+                finish_run(run_id, quiet=True)
+                raise Refused(f"the window could not be opened (xterm exited {term.returncode}).")
+        say(f"claude-classifier-docker: launched in a separate window ({TITLE}).")
+        say("  - Close the window or exit Claude to end the session.")
+        return 0
+    return run_session(run_id)
+
+
+def cmd_resume(args) -> int:
+    sid = newest_session() if args.cont else (args.resume or choose_session())
+    if not sid:
+        raise Refused("there is no Docker session to continue.")
+    reg = load_sessions()
+    rid = reg["sessions"].get(sid)
+    rec = reg["runs"].get(rid or "", {})
+    if not rec:
+        say(f"claude-classifier-docker: no launch settings were recorded for {sid[:8]}; "
+            "reopening it with the defaults.")
+    inputs = INPUTS / (rid or "")
+    ns = argparse.Namespace(**vars(args))
+    ns.workspace = args.workspace or rec.get("workspace")
+    ns.write = args.write or rec.get("writes") or []
+    ns.allow_host = args.allow_host or rec.get("allow_hosts") or []
+    ns.model = args.model or (rec.get("model") if rec.get("model") != saved_default() else None)
+    ns.brief_file = args.brief_file or (str(inputs / "brief.md") if (inputs / "brief.md").is_file() else None)
+    ns.settings_file = args.settings_file or (str(inputs / "settings.json")
+                                              if (inputs / "settings.json").is_file() else None)
+    ns.prompt_file = None
+    return cmd_launch(ns, resume=sid)
+
+
+def reload_proxy(run_id) -> bool:
+    """Make a running session's squid re-read its allow-list, and wait until it has.
+
+    SIGHUP from outside (`docker kill -s HUP`): squid runs as PID 1 in its
+    container, and `squid -k reconfigure` refuses to signal PID 1."""
+    log = CACHE / "proxy-logs" / run_id / "cache.log"
+    def ready_count():
+        try:
+            return log.read_text(errors="replace").count("Accepting HTTP")
+        except OSError:
+            return 0
+    before = ready_count()
+    r = docker("kill", "-s", "HUP", f"claude-classifier-docker-proxy-{run_id}")
+    if r.returncode != 0:
+        say(f"  could not reload the proxy of {run_id}: {r.stderr.strip()}", err=True)
+        return False
+    for _ in range(100):
+        if ready_count() > before:
+            return True
+        time.sleep(0.1)
+    say(f"  the proxy of {run_id} did not confirm the reload; see {log}", err=True)
+    return False
+
+
+def cmd_allow(host, keep, only=None) -> int:
+    h = host.lower()
+    if not HOST_RE.match(h):
+        say(f"claude-classifier-docker: not a host name: {host}", err=True)
+        return 2
+    if h in ANTHROPIC_HOSTS:
+        say(f"{h} is always allowed.")
+        return 0
+    live = []
+    for run in (RUNS.iterdir() if RUNS.is_dir() else []):
+        if only and run.name != only:
+            continue
+        try:
+            pid = int((run / "runner.pid").read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if not pid_alive(pid):
+            continue
+        extra = run / "proxy" / "extra-hosts.txt"
+        if h not in list_lines(extra):
+            with open(extra, "a", encoding="utf-8") as fh:
+                fh.write(h + "\n")
+        hosts_file(run)
+        if reload_proxy(run.name):
+            live.append(run.name)
+    if keep:
+        if h not in [x.lower() for x in list_lines(ALLOWED_HOSTS)]:
+            with open(ALLOWED_HOSTS, "a", encoding="utf-8") as fh:
+                fh.write(h + "\n")
+        say(f"claude-classifier-docker: {h} saved in {ALLOWED_HOSTS} for future sessions.")
+    if live:
+        say(f"claude-classifier-docker: {h} is allowed now in {len(live)} running session(s); "
+            "no restart needed.")
+    elif not keep:
+        say("claude-classifier-docker: no session is running. To allow it for future sessions: "
+            f"claude-classifier-docker --allow {h} --keep")
+    return 0
+
+
+# ─────────────────────────────── self-test ─────────────────────────────────
+PROBE = r'''
+set -u
+ok() { echo "PASS $1"; }
+bad() { echo "FAIL $1${2:+ — $2}"; }
+P="$HTTPS_PROXY"
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 20 https://api.anthropic.com/ 2>&1); [ "$c" != "000" ] && ok "V1 api.anthropic.com reachable through the proxy ($c)" || bad "V1 api.anthropic.com" "$c"
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 20 https://www.tides.gc.ca/ 2>&1); [ "$c" != "000" ] && ok "V1 a listed host (www.tides.gc.ca) reachable ($c)" || bad "V1 www.tides.gc.ca" "$c"
+e=$(curl -sS -o /dev/null -m 20 https://pypi.org/ 2>&1); echo "$e" | grep -q 403 && ok "V2 unlisted pypi.org refused by the proxy (403)" || bad "V2 pypi.org" "$e"
+curl -s -o /dev/null -m 8 --noproxy '*' https://pypi.org/ && bad "V2 direct route exists" || ok "V2 no direct route (--noproxy)"
+e=$(curl -sS -o /dev/null -m 10 -p -x "$P" http://api.anthropic.com:22/ 2>&1); echo "$e" | grep -q 403 && ok "V2 CONNECT to port 22 of an allowed host refused" || bad "V2 port 22" "$e"
+getent hosts example.com >/dev/null 2>&1 && bad "V3 outside DNS resolves" || ok "V3 no outside DNS"
+touch /workspace/cd-selftest 2>/dev/null && bad "V4 /workspace writable" || ok "V4 /workspace read-only"
+touch /workspace/w/cd-selftest 2>/dev/null && ok "V4 --write folder writable" || bad "V4 --write folder"
+command -v sudo >/dev/null && bad "V5 sudo present" || ok "V5 no sudo"
+[ "$(id -u)" = 1000 ] && ok "V5 uid 1000" || bad "V5 uid" "$(id -u)"
+grep -q '^CapEff:[[:space:]]*0000000000000000' /proc/self/status && ok "V5 no capabilities" || bad "V5 capabilities" "$(grep CapEff /proc/self/status)"
+[ ! -e /mnt/wslg ] && [ ! -e /tmp/.X11-unix ] && [ -z "${DISPLAY:-}" ] && ok "V6 no display mounts or DISPLAY" || bad "V6 display access"
+[ ! -e /mnt/wslg/distro ] && ok "V6 no WSL root (/mnt/wslg/distro)" || bad "V6 WSL root visible"
+extra=$(ls -A /home/node/.claude/projects | grep -v '^-workspace$' | tr '\n' ' '); [ -z "$extra" ] && ok "V7 no host Claude projects visible" || bad "V7 host projects" "$extra"
+[ ! -s /workspace/.env ] && ok "V8 masked file reads empty" || bad "V8 masked file" "$(head -c 20 /workspace/.env)"
+[ -r /etc/claude-code/managed-settings.json ] && ok "V8 policy readable" || bad "V8 policy readable"
+( echo x >> /etc/claude-code/managed-settings.json ) 2>/dev/null && bad "V8 policy writable" || ok "V8 policy cannot be written"
+for t in $CD_HOST_TARGETS; do
+  timeout 3 bash -c "exec 3<>/dev/tcp/${t%:*}/${t##*:}" 2>/dev/null && bad "V13 reached this machine at $t" || ok "V13 cannot reach this machine at $t"
+done
+gw=$(awk '$2 == "00000000" {print $3}' /proc/net/route); [ -z "$gw" ] && ok "V13 no default route out of the session network" || bad "V13 default route" "$gw"
+mkdir -p /home/node/.claude/skills/x && echo planted > /home/node/.claude/CLAUDE.md && echo planted > /home/node/.claude/skills/x/SKILL.md
+echo "selftest note" > /home/node/.claude/projects/-workspace/memory/cd-selftest-note.md
+touch /workspace/w/allow-now; for i in $(seq 1 60); do [ -e /workspace/w/allowed ] && break; sleep 0.5; done
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 20 https://pypi.org/ 2>&1); [ "$c" = 200 ] && ok "V16 pypi.org works after --allow, no restart ($c)" || bad "V16 after --allow" "$c"
+'''
+
+PROBE2 = r'''
+[ ! -e /home/node/.claude/CLAUDE.md ] && [ ! -e /home/node/.claude/skills/x ] && echo "PASS V14 planted CLAUDE.md/skills gone in the next session" || echo "FAIL V14 planted config survived"
+[ ! -e /home/node/.claude/projects/-workspace/memory/cd-selftest-note.md ] && echo "PASS V19 unapproved memory note not loaded by the next session" || echo "FAIL V19 memory note visible"
+c=$(curl -s -o /dev/null -w '%{http_code}' -m 20 https://pypi.org/ 2>&1); echo "$c" | grep -q 000 && echo "PASS V16 the --allow (without --keep) did not carry over" || echo "FAIL V16 pypi.org still allowed ($c)"
+'''
+
+
+def cmd_selftest() -> int:
+    ensure_docker()
+    reap_stale()
+    build_images(False)
+    ws = CACHE / "selftest-ws"
+    shutil.rmtree(ws, ignore_errors=True)
+    (ws / "w").mkdir(parents=True)
+    (ws / ".env").write_text("SECRET=do-not-show\n")
+    (ws / "README").write_text("claude-classifier-docker self-test workspace\n")
+    # a host service on every address, which the container must not reach
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", 0))
+    srv.listen(5)
+    port = srv.getsockname()[1]
+    addrs = subprocess.run(["hostname", "-I"], text=True, capture_output=True).stdout.split()
+    addrs = list(dict.fromkeys([a for a in addrs if ":" not in a] + ["172.17.0.1"]))
+    targets = " ".join(f"{a}:{port}" for a in addrs)
+    ns = argparse.Namespace(workspace=str(ws), write=["w"], allow_host=[], prompt_file=None,
+                            brief_file=None, settings_file=None, model=None, gui=False,
+                            shell=False, upgrade=False)
+    pending_before = {p.name for p in pending_sets()}
+    results = []
+    own_runs = []                        # the self-test's own run ids (real sessions may be open)
+
+    def run_probe(script):
+        for f in ("allow-now", "allowed"):             # a fresh signal for each session
+            (ws / "w" / f).unlink(missing_ok=True)
+        run_id, meta = prepare(ns, command=["bash", "-c", script], tty=False)
+        own_runs.append(run_id)
+        m = read_json(RUNS / run_id / "meta.json")
+        m["selftest"] = True
+        write_json(RUNS / run_id / "meta.json", m)
+        a = read_json(RUNS / run_id / "docker-args.json")
+        a[a.index("--network"):a.index("--network")] = ["-e", f"CD_HOST_TARGETS={targets}"]
+        write_json(RUNS / run_id / "docker-args.json", a)
+        (RUNS / run_id / "runner.pid").write_text(f"{os.getpid()}\n")
+        stop = threading.Event()
+
+        def watcher():                              # plays the person running --allow
+            while not stop.is_set():
+                if (ws / "w" / "allow-now").exists():
+                    cmd_allow("pypi.org", keep=False, only=run_id)   # never a real session
+                    (ws / "w" / "allowed").touch()
+                    return
+                time.sleep(0.3)
+        t = threading.Thread(target=watcher, daemon=True)
+        t.start()
+        out = subprocess.run(["docker", *a], text=True, capture_output=True, timeout=600).stdout
+        stop.set()
+        log = (CACHE / "proxy-logs" / run_id / "access.log")
+        acc = log.read_text(errors="replace") if log.is_file() else ""
+        finish_run(run_id, quiet=True)
+        return out, acc
+
+    try:
+        say("claude-classifier-docker self-test: first session…")
+        out, acc = run_probe(PROBE)
+        results += out.splitlines()
+        results.append(("PASS" if "TCP_TUNNEL" in acc and "api.anthropic.com" in acc else "FAIL")
+                       + " V10 the proxy log records the allowed tunnels")
+        results.append(("PASS" if "TCP_DENIED" in acc and "pypi.org" in acc else "FAIL")
+                       + " V10 the proxy log records the refusals")
+        if "pypi.org" in [x.lower() for x in list_lines(ALLOWED_HOSTS)]:
+            results.append("FAIL V16 --allow without --keep saved the host")
+        new_sets = [p for p in pending_sets() if p.name not in pending_before]
+        results.append(("PASS" if new_sets else "FAIL")
+                       + " V19 the session's memory note was held as a pending set")
+        say("claude-classifier-docker self-test: second session…")
+        out2, _ = run_probe(PROBE2)
+        results += out2.splitlines()
+        for p in pending_sets():
+            if p.name not in pending_before:
+                shutil.rmtree(p, ignore_errors=True)       # the self-test's own note
+        leftovers = [c for rid in own_runs for c in
+                     docker("ps", "-a", "--filter", f"label={LABEL}={rid}", "-q").stdout.split()]
+        nets = [n for rid in own_runs for n in
+                docker("network", "ls", "--filter", f"label={LABEL}={rid}", "-q").stdout.split()]
+        leftovers += [r for r in own_runs if (RUNS / r).exists()]
+        live_runs = [r for r in RUNS.iterdir()] if RUNS.is_dir() else []
+        results.append(("PASS" if not leftovers and not nets else "FAIL")
+                       + " V11 the test's own containers, networks and run folders are gone"
+                       + (f" ({len(leftovers)} containers, {len(nets)} networks)" if leftovers or nets else ""))
+        # refusals
+        for bad_ws in (str(HOME), "/mnt/c/Users", "/"):
+            try:
+                resolve_workspace(bad_ws)
+                results.append(f"FAIL V4 {bad_ws} was accepted as a launch folder")
+            except Refused:
+                results.append(f"PASS V4 {bad_ws} refused as a launch folder")
+        (ws / "link").symlink_to(ws / "w")
+        try:
+            resolve_writes(ws.resolve(), ["link"])
+            results.append("FAIL V4 a symlinked --write folder was accepted")
+        except Refused:
+            results.append("PASS V4 a symlinked --write folder is refused")
+        del live_runs
+    finally:
+        srv.close()
+        shutil.rmtree(ws, ignore_errors=True)
+    passed = sum(1 for r in results if r.startswith("PASS"))
+    failed = [r for r in results if r.startswith("FAIL")]
+    say("")
+    for r in results:
+        if r.startswith(("PASS", "FAIL")):
+            say("  " + r)
+    say(f"\nclaude-classifier-docker self-test: {passed} passed, {len(failed)} failed.")
+    say("Not automatic (check by hand): V9 policy in /status and no auto/bypass mode; "
+        "V12 WebSearch/WebFetch in a session; the OSC 52 clipboard test; V17/V18; the ZIS buttons.")
+    return 1 if failed else 0
+
+
+# ─────────────────────────────── main ──────────────────────────────────────
+def parse(argv):
+    p = argparse.ArgumentParser(prog="claude-classifier-docker", add_help=False,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("workspace", nargs="?")
+    p.add_argument("-h", "--help", action="store_true")
+    p.add_argument("--gui", action="store_true")
+    p.add_argument("--shell", action="store_true")
+    p.add_argument("--upgrade", "--rebuild", dest="upgrade", action="store_true")
+    p.add_argument("--models", action="store_true")
+    p.add_argument("--default-model")
+    p.add_argument("--model")
+    p.add_argument("--prompt-file")
+    p.add_argument("--brief-file")
+    p.add_argument("--settings-file")
+    p.add_argument("--write", action="append")
+    p.add_argument("--allow-host", action="append")
+    p.add_argument("--allow")
+    p.add_argument("--keep", action="store_true")
+    p.add_argument("--continue", dest="cont", action="store_true")
+    p.add_argument("--resume", nargs="?", const="")
+    p.add_argument("--memory", action="store_true")
+    p.add_argument("--policy", nargs="?", const="show")
+    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--_run", dest="run_id", help=argparse.SUPPRESS)
+    p.add_argument("--_window", dest="window_run_id", help=argparse.SUPPRESS)
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse(sys.argv[1:] if argv is None else argv)
+    if args.help:
+        say(__doc__.strip())
+        return 0
+    try:
+        if args.run_id:
+            return run_session(args.run_id)
+        if args.window_run_id:
+            return run_window(args.window_run_id)
+        if args.default_model:
+            m = resolve_model(args.default_model)
+            if not m:
+                say(f"claude-classifier-docker: not a model name or a number from the list: {args.default_model}", err=True)
+                return 1
+            save_default(m)
+            return 0
+        if args.models:
+            return cmd_models()
+        if args.policy:
+            return cmd_policy(args.policy)
+        if args.memory:
+            return cmd_memory()
+        if args.allow:
+            return cmd_allow(args.allow, args.keep)
+        if args.selftest:
+            return cmd_selftest()
+        if args.upgrade and not (args.workspace or args.gui or args.shell):
+            ensure_docker()
+            reap_stale()
+            build_images(True)
+            return 0
+        if args.cont or args.resume is not None:
+            return cmd_resume(args)
+        return cmd_launch(args)
+    except Refused as exc:
+        say(f"claude-classifier-docker: {exc}", err=True)
+        if getattr(args, "gui", False):
+            show_error_window(str(exc))
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
