@@ -142,6 +142,7 @@ KNOWN_BUNDLES = {
     "maplibre-gl": "BSD-3-Clause", "bootstrap": "MIT", "vexflow": "MIT",
     "tone": "MIT", "abcjs": "MIT", "codemirror": "MIT", "marked": "MIT",
     "pmtiles": "BSD-3-Clause", "katex": "MIT", "mathjax": "Apache-2.0",
+    "pyodide": "MPL-2.0",
 }
 
 
