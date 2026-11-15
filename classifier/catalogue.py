@@ -222,6 +222,18 @@ def release_downloads(repo: str) -> list[tuple[str, str]]:
     return out
 
 
+PACKAGE_LABELS = {".exe": "installer", ".msi": "installer", ".dmg": "app", ".pkg": "installer",
+                  ".appimage": "app", ".deb": "package", ".rpm": "package", ".flatpak": "package"}
+
+
+def package_label(plat: str, url: str) -> str:
+    """e.g. 'Windows installer (.exe)', 'macOS app (.dmg)', 'Linux app (.AppImage)'."""
+    name = url.rsplit("/", 1)[-1]
+    ext = "." + name.rsplit(".", 1)[-1] if "." in name else ""
+    kind = PACKAGE_LABELS.get(ext.lower(), "download")
+    return f"{plat} {kind} ({ext})" if ext else plat
+
+
 def find_downloads(sws: list[dict], placements: dict | None) -> dict:
     """{software name: release_downloads(...)} for the given software."""
     out = {}
@@ -261,16 +273,20 @@ def entry(sw: dict, st: dict, placements=None, downloads: list | None = None) ->
     meta.append("**Runs on:** " + ", ".join(plats))
     out += [" · ".join(meta), ""]
     if downloads:
-        out += ["**Download** (ready to run, nothing else to install): "
-                + " · ".join(f"[{plat}]({url})" for plat, url in downloads), ""]
+        out += ["**Download the program** (executable: double-click to install and run, "
+                "nothing else needed): "
+                + " · ".join(f"[{package_label(plat, url)}]({url})" for plat, url in downloads), ""]
     ai_text = aiuse.describe(sw)
     if ai_text:
         out += [f"**AI:** {ai_text}", ""]
+    if downloads:
+        out += ["Or install from the source code, at the command line:", ""]
     for p in plats:
         steps = install_steps(sw, p, loc)
         if not steps:
             continue
-        out += [f"<details><summary>Install on {p}</summary>", ""]
+        out += [f"<details><summary>Install on {p} at the command line (from the source "
+                f"code)</summary>", ""]
         if where_to_type(p) and not steps[0].startswith("Open "):
             out += [where_to_type(p), ""]
         out += ["```"] + steps + ["```", ""]

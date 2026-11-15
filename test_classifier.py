@@ -260,7 +260,11 @@ class Catalogue(unittest.TestCase):
         self.assertNotIn("untested", text)
         dl = catalogue.entry(reg.software["Shown"], st["Shown"], None,
                              [("Windows", "https://x/a.exe"), ("Linux", "https://x/a.AppImage")])
-        self.assertIn("**Download** (ready to run, nothing else to install): [Windows](https://x/a.exe)", dl)
+        self.assertIn("**Download the program** (executable: double-click to install and run, "
+                      "nothing else needed): [Windows installer (.exe)](https://x/a.exe) · "
+                      "[Linux app (.AppImage)](https://x/a.AppImage)", dl)
+        self.assertIn("Or install from the source code, at the command line:", dl)
+        self.assertIn("Install on Linux at the command line (from the source code)", dl)
         reg.settings["contact"] = "someone@example.org"
         self.assertIn("please write to someone@example.org",
                       catalogue.page(reg, st, {"Shown": [{"repo": "me/shown", "path": "",
