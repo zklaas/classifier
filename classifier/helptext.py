@@ -208,8 +208,9 @@ or a new repository named after it. You can change the destination.</li>
 <li><b>Your folder.</b> The work happens in a temporary copy. Files on GitHub that are
 not in your folder are kept unless you tick <i>Remove these</i>. If your folder is itself
 a git copy of the repository, tick <i>Bring the new commit into your folder's git copy</i>
-(the same as <code>git pull</code>, but your files stay exactly as they are; anything only
-on GitHub is copied in).</li>
+(like <code>git pull</code>: files you have not changed are brought up to date, including
+the PLATFORMS.md and THIRD-PARTY.md that publishing writes, and anything only on GitHub is
+copied in; files you changed are left as they are, and nothing is deleted).</li>
 <li><b>Making it public.</b> For Releasable software in a private repository, tick
 <i>Make the repository public</i>. A public repository shows its whole history, so
 Classifier first checks every past commit: if any holds a file Provenance excludes or a

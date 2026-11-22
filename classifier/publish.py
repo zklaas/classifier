@@ -398,33 +398,51 @@ def local_clone_of(root: Path, dest: dict) -> bool:
 
 def sync_local(root: Path, branch: str) -> str:
     """Bring the published commit into the software's own git copy, like a pull
-    that keeps every file in the folder exactly as it is.
+    that never touches a change you made.
 
     The folder's branch is moved to the published commit (git reset --mixed:
-    the index changes, the files do not).  Files the commit has but the folder
-    lacks (generated LICENSE / THIRD-PARTY.md / PLATFORMS.md / .gitignore, files
-    pushed from elsewhere) are copied in; the published .gitignore replaces the
-    folder's.  The previous commit stays reachable through `git reflog`."""
+    the index changes, the files do not).  Then, as `git pull` would, files the
+    commit has but the folder lacks are copied in, and files the folder has not
+    changed since its previous commit are updated to the published version
+    (e.g. PLATFORMS.md / THIRD-PARTY.md that publishing regenerated); the
+    published .gitignore replaces the folder's.  Files you changed are left as
+    they are, and nothing is ever deleted.  The previous commit stays reachable
+    through `git reflog`."""
     root = Path(root)
     _git(root, "fetch", "--quiet", "origin", timeout=600)
     cur = _git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
     if cur != branch:
         return (f"Your folder is on branch {cur}, not {branch}, so it was left as it is; "
                 f"switch to {branch} and publish again to bring it up to date.")
-    old = _git(root, "rev-parse", "--short", "HEAD").strip()
+    old_full = _git(root, "rev-parse", "HEAD").strip()
+    old = old_full[:7]
     _git(root, "reset", "--quiet", "--mixed", f"origin/{branch}")
-    missing = [ln[3:] for ln in _git(root, "status", "--porcelain").splitlines()
-               if ln.startswith(" D ")]
-    take = set(missing) | {".gitignore"}
+    missing, modified = [], []
+    for ln in _git(root, "status", "--porcelain", "-z").split("\0"):
+        if ln.startswith(" D "):
+            missing.append(ln[3:])
+        elif ln.startswith(" M "):
+            modified.append(ln[3:])
+    unchanged = [rel for rel in modified if _same_as(root, old_full, rel)]
+    take = set(missing) | set(unchanged) | {".gitignore"}
     for rel in sorted(take):
         _git(root, "checkout", f"origin/{branch}", "--", rel, check=False)
     left = [ln for ln in _git(root, "status", "--porcelain").splitlines()]
     new = _git(root, "rev-parse", "--short", "HEAD").strip()
     msg = f"Your folder's git copy is now at the published commit {new} (it was at {old})."
     if left:
-        msg += (f" {len(left)} file(s) in the folder differ from it (changes made since, or "
-                "files kept out of the release); nothing was overwritten.")
+        msg += (f" {len(left)} file(s) in the folder differ from it (your own changes, or "
+                "files kept out of the release); those were left as they are.")
     return msg
+
+
+def _same_as(root: Path, commit: str, rel: str) -> bool:
+    """True when the folder's file is exactly the one in `commit` (so it was not
+    changed by hand since then)."""
+    was = _git(root, "rev-parse", "--verify", "--quiet", f"{commit}:{rel}",
+               check=False).strip()
+    now = _git(root, "hash-object", "--", rel, check=False).strip()
+    return bool(was) and was == now
 
 
 def history_exposes(clone: Path, dest: dict, pl: dict) -> list[str]:

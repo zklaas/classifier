@@ -392,6 +392,37 @@ class PublishSyncAndPublic(unittest.TestCase):
                                progress=lambda m: None, sync_folder=True)
         self.assertIn("Nothing new to commit", out2)
 
+    def test_sync_updates_regenerated_files(self):
+        """A generated file the folder has not touched (here THIRD-PARTY.md) is
+        brought up to date by the sync, like git pull; a hand-edited one is not."""
+        from classifier import publish
+        tmp = Path(tempfile.mkdtemp())
+        bare = tmp / "remote.git"
+        self.git("init", "--bare", "-q", "-b", "main", str(bare))
+        folder = tmp / "Gen"
+        self.git("clone", "-q", str(bare), str(folder))
+        (folder / "gen.py").write_text("x\n")
+        (folder / "LICENSE").write_text("MIT, made with Claude, an AI\n")
+        (folder / "THIRD-PARTY.md").write_text("old generated text\n")
+        (folder / "notes.md").write_text("mine\n")
+        self.git("add", "-A", cwd=folder)
+        self.git("commit", "-qm", "first", cwd=folder)
+        self.git("push", "-q", "origin", "main", cwd=folder)
+        (folder / "notes.md").write_text("mine, edited\n")       # a local edit
+        sw = model.new_software("Gen", str(folder))
+        sw["scan"] = {"findings": [{"key": "lib:x", "kind": "package", "title": "Lib X",
+                                    "detail": "", "paths": ["gen.py"], "auto": None}]}
+        sw["resolutions"] = {"lib:x": {"kind": "opensource", "licence": "MIT", "note": "n"}}
+        dest = {"repo": "me/gen", "path": "", "exists": True, "branches": ["main"],
+                "visibility": "PRIVATE"}
+        publish.publish(sw, {"ai_system": "Claude"}, dest, remote_url=str(bare),
+                        progress=lambda m: None, sync_folder=True)
+        third = (folder / "THIRD-PARTY.md").read_text()
+        self.assertIn("Lib X", third)
+        self.assertEqual((folder / "notes.md").read_text(), "mine, edited\n")
+        self.assertEqual(self.git("status", "--porcelain", "--", "THIRD-PARTY.md",
+                                  cwd=folder), "")
+
 
 class Licence(unittest.TestCase):
     def test_build_and_check(self):

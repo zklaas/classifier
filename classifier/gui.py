@@ -466,8 +466,8 @@ class PublishDialog(QDialog):
 
         self.branch_box = QVBoxLayout()
         lay.addLayout(self.branch_box)
-        self.sync_cb = QCheckBox("Bring the new commit into your folder's git copy too (your "
-                                 "files stay exactly as they are)")
+        self.sync_cb = QCheckBox("Bring the new commit into your folder's git copy too (like "
+                                 "git pull; files you changed stay as they are)")
         self.sync_cb.setChecked(True)
         lay.addWidget(self.sync_cb)
         self.public_cb = QCheckBox("Make the repository public")
