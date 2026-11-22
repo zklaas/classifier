@@ -127,12 +127,27 @@ def plan(sw: dict) -> dict:
 
 
 def _git_ignored(root: Path) -> set[str]:
-    """Files the folder's own .gitignore keeps out (when it is a git working
-    tree): they are outside what the scan saw, so they are not published either."""
-    if not (Path(root) / ".git").exists():
+    """Files the folder's own .gitignore keeps out.  They are left out quietly:
+    not published, and not listed one by one in the published .gitignore (whose
+    own patterns already cover them), so private file names don't leak.
+
+    A git working tree is asked directly.  A plain folder with a .gitignore is
+    asked through a throwaway empty repository pointed at it (git reads
+    .gitignore files only inside a repository); the folder itself is untouched."""
+    root = Path(root)
+    cmd = ["ls-files", "-z", "--others", "--ignored", "--exclude-standard"]
+    if (root / ".git").exists():
+        r = subprocess.run(["git", "-C", str(root), *cmd], capture_output=True)
+    elif any(root.rglob(".gitignore")):
+        with tempfile.TemporaryDirectory(prefix="classifier-ignore-") as tmp:
+            try:
+                subprocess.run(["git", "init", "-q", tmp], capture_output=True, check=True)
+                r = subprocess.run(["git", f"--git-dir={tmp}/.git", f"--work-tree={root}", *cmd],
+                                   capture_output=True)
+            except (OSError, subprocess.CalledProcessError):
+                return set()
+    else:
         return set()
-    r = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--others", "--ignored",
-                        "--exclude-standard"], capture_output=True)
     if r.returncode != 0:
         return set()
     return {x for x in r.stdout.decode("utf-8", "replace").split("\0") if x}

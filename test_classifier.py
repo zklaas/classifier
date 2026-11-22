@@ -342,6 +342,32 @@ class PublishRespectsReviewItemsAndGitignore(unittest.TestCase):
         self.assertNotIn("samples/a.wav", pl["include"])
         self.assertNotIn("secret/notes.txt", pl["include"])     # the folder's .gitignore
 
+    def test_plain_folder_gitignore_keeps_private_names_out(self):
+        """Not a git repository: its .gitignore still applies, and the files it covers
+        are not named one by one in the published .gitignore."""
+        from classifier import publish
+        tmp = Path(tempfile.mkdtemp())
+        d = make_soft(tmp, "P", {"p.py": "x=1\n", ".gitignore": "data/\n",
+                                 "data/settings.json": "{}", "data/cache/My_Private_Video_123.mp4": b"\0"})
+        self.assertFalse((d / ".git").exists())
+        sw = model.new_software("P", str(d))
+        sw["scan"] = {"findings": [{"key": "file:data/settings.json", "kind": "claude", "title": "s",
+                                    "detail": "", "paths": ["data/settings.json"], "auto": None}]}
+        sw["resolutions"] = {"file:data/settings.json": {"kind": "excluded"}}
+        pl = publish.plan(sw)
+        self.assertEqual(pl["include"], [".gitignore", "p.py"])
+        self.assertEqual(pl["excluded"], [])
+        out = {rel for rel, _ in pl["always_out"]}
+        self.assertIn("data/settings.json", out)
+        self.assertIn("data/cache/My_Private_Video_123.mp4", out)
+        target = Path(tempfile.mkdtemp())
+        (target / ".gitignore").write_text("data/\n")
+        publish._write_gitignore(target, pl)
+        text = (target / ".gitignore").read_text()
+        self.assertNotIn("settings.json", text)
+        self.assertNotIn("Private_Video", text)
+        self.assertFalse((d / ".git").exists())                  # the folder was not made a repository
+
 
 class PublishSyncAndPublic(unittest.TestCase):
     def git(self, *a, cwd=None):
