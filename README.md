@@ -88,7 +88,9 @@ folder or repository with matching files, or a link set by hand), and:
   own) or its folder removed on every branch (shared), after a full backup clone in
   `~/.local/share/classifier/backups/`; you type the repository name to confirm;
 - warnings for public releasable software without a passing licence, Excluded files
-  found in public repositories, and unclassified public software.
+  found in public repositories, and unclassified public software;
+- downloads: public releasable software with no release build, no release yet, or a
+  release older than the files that go into it (see Downloads).
 
 Deleting a repository needs `gh auth refresh -h github.com -s delete_repo` once.
 
@@ -103,6 +105,21 @@ review folders, secret-looking and >100 MB files are always left out; exclusions
 the published `.gitignore`. LICENSE, THIRD-PARTY.md and PLATFORMS.md (Supported
 platforms only) are added; supported-platform branches can be merged. Done in a
 temporary clone: the software's folder is not changed.
+
+## Downloads
+
+`classifier/releases.py`. The catalogue's *Download the program* links come from each
+repository's latest GitHub release. **Set up downloads…** (GitHub tab) / `classifier
+release NAME --setup` writes a release build into a Python program's folder: a GitHub
+Actions workflow (PyInstaller; Windows installer via Inno Setup, macOS disk image,
+Linux AppImage, for the platforms marked Supported; a start-up check), the installer
+script, release notes and a README Download section. It works out the start script,
+packages (with known PyInstaller quirks), the data the program opens by name, icons and
+macOS microphone/camera permission notes, and warns about what breaks once packaged:
+saving beside itself without a `sys.frozen` check, QtWebEngine's sandbox in an
+AppImage. **Build a release…** / `classifier release NAME --build` / `classifier
+publish NAME --release` runs the workflow, waits, then updates the catalogue. Any
+workflow that creates a GitHub release counts as a release build.
 
 ## Catalogue
 
@@ -131,6 +148,6 @@ ends the session so the sign-in is saved.
 
 - Registry: `~/.config/classifier/registry.json` (`CLASSIFIER_CONFIG` overrides the folder)
 - `classifier/`: `model.py` (groups, clearance), `scanner.py`, `licences.py`,
-  `platforms.py`, `github.py`, `review.py`, `gui.py`, `cli.py`, `helptext.py`
+  `platforms.py`, `github.py`, `releases.py`, `review.py`, `gui.py`, `cli.py`, `helptext.py`
 - Tests: `python3 -m unittest test_classifier` (no network)
 - Icon: `python3 make_icon.py && ./install-desktop.sh`

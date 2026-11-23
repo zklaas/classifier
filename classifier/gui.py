@@ -16,7 +16,8 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem, QTabWidget, QTextBrowser, QToolBar, QVBoxLayout, QWidget)
 
-from . import aiuse, catalogue, github, helptext, publish, licences, model, platforms, review, status
+from . import (aiuse, catalogue, github, helptext, publish, licences, model, platforms, releases,
+               review, status)
 
 APP_DIR = Path(__file__).resolve().parent.parent
 GROUP_COLOURS = {
@@ -475,6 +476,10 @@ class PublishDialog(QDialog):
                                   "checks that no past commit holds an excluded or "
                                   "secret-looking file")
         lay.addWidget(self.public_cb)
+        self.release_cb = QCheckBox("Then build a new release (the downloads) on GitHub and "
+                                    "update the catalogue when it is done (10-20 minutes)")
+        self.release_cb.setToolTip("Runs the software's release build after the push")
+        lay.addWidget(self.release_cb)
         self.branch_checks = []
         msg_row = QHBoxLayout()
         msg_row.addWidget(QLabel("Commit message:"))
@@ -551,6 +556,8 @@ class PublishDialog(QDialog):
         else:
             self.public_cb.setText("Make the repository public (its history is checked "
                                    "first)")
+        self.release_cb.setVisible(bool(releases.setup_info(self.sw["path"]))
+                                   and not path and not self.private_only)
         probs = publish.blockers(self.sw, self.st, self.dest)
         if self.private_only and not exists and "/" not in repo:
             probs.append("Name the repository as owner/name.")
@@ -564,12 +571,19 @@ class PublishDialog(QDialog):
         new = "" if self.dest["exists"] else f"Create the {vis.upper()} repository {self.dest['repo']}, then "
         sync = self.sync_cb.isVisible() and self.sync_cb.isChecked()
         make_pub = self.public_cb.isVisible() and self.public_cb.isChecked()
+        build = (self.release_cb.isVisible() and self.release_cb.isChecked()
+                 and (make_pub or self.dest.get("visibility") == "PUBLIC"
+                      or (not self.dest["exists"] and vis == "public")))
         extra = ""
         if sync:
             extra += "\nYour folder's git copy will then be moved up to the new commit."
         if make_pub:
             extra += ("\nThen the repository is made PUBLIC: anyone will be able to see it "
                       "and its whole history.")
+        if build:
+            extra += "\nThen a new release is built on GitHub and the catalogue updated."
+        elif self.release_cb.isVisible() and self.release_cb.isChecked():
+            extra += "\n(No release: downloads are built only from a public repository.)"
         text = (f"{new}commit and push {len(self.plan['include'])} files of {self.sw['name']} to "
                 f"{self.dest['repo']}{'/' + self.dest['path'] if self.dest['path'] else ''}"
                 + (f", and merge into {', '.join(merges)}" if merges else "") + "?\n\n"
@@ -601,11 +615,108 @@ class PublishDialog(QDialog):
             self.out.setText("<span style='color:#2e7d32'><b>Done.</b></span> "
                              + html.escape(r).replace("\n", "<br>"))
             self.win.auto_catalogue()
+            if build:
+                self.win.build_release(sw, dest["repo"])
         wk.done.connect(done)
         wk.failed.connect(lambda e: (self.out.setText(
             "<span style='color:#c62828'><b>Not published.</b></span> " + html.escape(e)),
             self.go.setEnabled(True)))
         wk.start()
+
+
+class ReleaseSetupDialog(QDialog):
+    """Write a release build (GitHub Actions + PyInstaller) into a software's folder."""
+
+    def __init__(self, win, sw, repo):
+        super().__init__(win)
+        self.win, self.sw = win, sw
+        self.setWindowTitle(f"Set up downloads for {sw['name']}")
+        fit(self, 900, 640)
+        lay = QVBoxLayout(self)
+        head = QLabel(
+            "Downloads are ready-to-run packages of the program, built by GitHub for each "
+            "supported system: a Windows installer, a macOS disk image and a Linux AppImage. "
+            "Python and every package the program uses are inside, so people need nothing "
+            "else. The catalogue links to them.<br>This writes the build into the software's "
+            "folder; then <i>Commit and push</i> sends it to GitHub and <i>Build a "
+            "release</i> makes the packages.")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+        form = QFormLayout()
+        self.repo = QLineEdit(repo)
+        self.repo.editingFinished.connect(self._plan)
+        self.entry = QComboBox()
+        best, cands = releases.entry_point(sw)
+        for c in cands:
+            self.entry.addItem(c)
+        if best:
+            self.entry.setCurrentText(best)
+        self.entry.currentTextChanged.connect(self._plan)
+        self.force = QCheckBox("Replace the release build that is already there")
+        self.force.setVisible(bool(releases.setup_info(sw["path"])))
+        self.force.toggled.connect(self._plan)
+        form.addRow("GitHub repository:", self.repo)
+        form.addRow("Starts with:", self.entry)
+        form.addRow("", self.force)
+        lay.addLayout(form)
+        self.summary = QTextBrowser()
+        self.summary.setMaximumHeight(230)
+        lay.addWidget(self.summary)
+        self.files = QTabWidget()
+        lay.addWidget(self.files, 1)
+        bb = QDialogButtonBox()
+        self.go = bb.addButton("Write the files", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.go.clicked.connect(self.write)
+        bb.addButton(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._plan()
+
+    def _plan(self):
+        self.plan = releases.plan_setup(self.sw, self.win.reg.settings, self.repo.text().strip(),
+                                        entry=self.entry.currentText() or None,
+                                        force=self.force.isChecked())
+        i, rows = self.plan["info"], []
+        if i:
+            rows.append(f"<b>{html.escape(i['title'])}</b> starts with "
+                        f"<code>{html.escape(i['entry'] or '?')}</code>; "
+                        + ("a window program" if i["gui"] else "a command-line program")
+                        + f". Downloads for <b>{', '.join(i['platforms'])}</b> (its Supported "
+                          "platforms on the Platforms tab).")
+            rows.append("Packages installed for the build: " + html.escape(" ".join(i["pip"])))
+            rows.append("Bundled beside it: " + html.escape(", ".join(i["data"]) or "nothing"))
+            rows.append("Download names (the same in every release): "
+                        + html.escape(", ".join(i["assets"].values())))
+        rows += [f"<span style='color:#ef6c00'>! {html.escape(w)}</span>"
+                 for w in self.plan["warnings"]]
+        rows += [f"<span style='color:#c62828'>✖ {html.escape(p)}</span>"
+                 for p in self.plan["problems"]]
+        self.summary.setHtml("<br>".join(rows))
+        self.files.clear()
+        for rel, text in self.plan["files"].items():
+            t = QPlainTextEdit(text)
+            t.setReadOnly(True)
+            self.files.addTab(t, rel)
+        if self.plan["readme"] is not None:
+            t = QPlainTextEdit(self.plan["readme"])
+            t.setReadOnly(True)
+            self.files.addTab(t, "README (with a Download section)")
+        self.go.setEnabled(not self.plan["problems"])
+
+    def write(self):
+        try:
+            done = releases.write_setup(self.sw, self.plan)
+        except Exception as e:                      # noqa: BLE001 - shown to the user
+            QMessageBox.warning(self, "Set up downloads", str(e))
+            return
+        status.scan(self.sw, self.win.reg.owner_names(), self.win.reg.settings)
+        self.win.reg.save()
+        self.go.setEnabled(False)
+        QMessageBox.information(
+            self, "Set up downloads",
+            "Written:\n  " + "\n  ".join(done) + "\n\nNext: Commit and push to GitHub, "
+            "ticking \"Then build a new release\". When the build is done the catalogue "
+            "shows the download links.")
 
 
 class MainWindow(QMainWindow):
@@ -679,9 +790,10 @@ class MainWindow(QMainWindow):
         lay.addWidget(chips)
 
         split = QSplitter(Qt.Orientation.Horizontal)
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(["Software", "Development Group", "Cleared",
-                                              "Stage", "Suite", "Licence", "AI", "Platforms"])
+                                              "Stage", "Suite", "Licence", "AI", "Platforms",
+                                              "Downloads"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1010,6 +1122,20 @@ class MainWindow(QMainWindow):
         row.addWidget(b)
         row.addStretch(1)
         lay.addLayout(row)
+        row = QHBoxLayout()
+        b = QPushButton("Set up downloads…")
+        b.setToolTip("Write a release build into the software's folder: GitHub makes ready-"
+                     "to-run packages (Windows installer, macOS disk image, Linux AppImage) "
+                     "that the catalogue links to")
+        b.clicked.connect(self.setup_downloads)
+        row.addWidget(b)
+        self.build_btn = QPushButton("Build a release…")
+        self.build_btn.setToolTip("Run the release build on GitHub, wait for it, then update "
+                                  "the catalogue")
+        self.build_btn.clicked.connect(self.ask_build_release)
+        row.addWidget(self.build_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
         return w
 
     # ---------------------------------------------------------------- helpers
@@ -1082,7 +1208,7 @@ class MainWindow(QMainWindow):
                     licences.STATUS_SHORT.get(st["licence"], ""),
                     aiuse.SHORT.get(st["ai"], "") + ("?" if st["ai"] and not
                                                      (sw.get("ai") or {}).get("level") else ""),
-                    platforms.summary(sw)]
+                    platforms.summary(sw), releases.summary(sw)]
             for c, v in enumerate(vals):
                 it = QTableWidgetItem(v)
                 if c == 0:
@@ -1103,6 +1229,10 @@ class MainWindow(QMainWindow):
                 if c == 7 and platforms.warnings(sw):
                     it.setForeground(QColor("#ef6c00"))
                     it.setToolTip("\n".join(platforms.warnings(sw)))
+                if c == 8 and v:
+                    if v in ("none", "set up, not built") or "older" in v:
+                        it.setForeground(QColor("#ef6c00"))
+                    it.setToolTip("\n".join(releases.describe(sw)))
                 self.table.setItem(r, c, it)
             if n == self.current:
                 sel_row = r
@@ -1559,7 +1689,13 @@ class MainWindow(QMainWindow):
             where = "<br>".join(f"{l['repo']}{'/' + l['path'] if l['path'] else ''}: "
                                 f"<b>{l['visibility'].lower()}</b>, branches {', '.join(l['branches'])} "
                                 f"<small>(found by {html.escape(l['how'])})</small>" for l in locs)
-        self.g_text.setHtml(f"<p><b>{g}</b>: {rule}</p><p>{where}</p>")
+        dl = "<br>".join(html.escape(x) for x in releases.describe(sw))
+        warn = "".join(f"<br><span style='color:#ef6c00'>! {html.escape(p)}</span>"
+                       for p in (releases.problems_when_packaged(sw)
+                                 if releases.setup_info(sw["path"]) else []))
+        self.g_text.setHtml(f"<p><b>{g}</b>: {rule}</p><p>{where}</p>"
+                            f"<p><b>Downloads</b><br>{dl}{warn}</p>")
+        self.build_btn.setEnabled(bool(releases.setup_info(sw["path"])))
 
     def start_publish(self):
         sw = self.cur()
@@ -1594,12 +1730,16 @@ class MainWindow(QMainWindow):
             for sw in self.reg.software.values():
                 status.refresh_fingerprint(sw)
             snap = github.snapshot(o, progress=lambda i, n, r: progress(f"{r} ({i + 1}/{n})"))
-            return snap
+            sts = {n: status.of(sw, self.reg.settings) for n, sw in self.reg.software.items()}
+            _, placed = github.audit(self.reg, snap, sts)
+            return snap, releases.audit(self.reg, sts, placed, snap, progress=progress)
 
-        def done(snap):
+        def done(res):
+            snap, rel_issues = res
             self.snap = snap
             self.refresh_all()
             issues, placements = github.audit(self.reg, snap, self.statuses)
+            issues += rel_issues
             self.placements = placements
             for n, sw in self.reg.software.items():
                 if sw.get("scan"):
@@ -1610,6 +1750,69 @@ class MainWindow(QMainWindow):
                 self.auto_catalogue(snap)       # nothing to change on GitHub: refresh now
             GithubDialog(self, issues, placements).exec()
         self._run("Reading GitHub", work, done)
+
+    # ---------------------------------------------------------------- downloads
+    def _repo_guess(self, sw) -> str:
+        loc = next((l for l in (self.placements or {}).get(sw["name"], []) if not l["path"]), None)
+        if loc:
+            return loc["repo"]
+        r = (sw.get("release_state") or {}).get("repo")
+        if r:
+            return r
+        owner = self.reg.settings.get("github_owner") or model.gh_login()
+        return f"{owner}/{Path(sw['path']).name.lower()}" if owner else ""
+
+    def setup_downloads(self):
+        sw = self.cur()
+        if not sw:
+            return
+        ReleaseSetupDialog(self, sw, self._repo_guess(sw)).exec()
+        self.refresh_all()
+
+    def ask_build_release(self):
+        sw = self.cur()
+        if not sw:
+            return
+        repo = self._repo_guess(sw)
+        rel = releases.latest_release(repo) if repo else None
+        version, ok = QInputDialog.getText(
+            self, "Build a release",
+            f"Build a new release of {sw['name']} on GitHub ({repo})?\n\n"
+            + (f"The latest is {rel['tag']} ({rel['at'][:10]}).\n" if rel else
+               "There is no release yet.\n")
+            + "The files on GitHub are what gets built: Commit and push first if your folder "
+              "has changes.\nIt takes about 10-20 minutes; the catalogue is updated when it is "
+              "done.\n\nVersion number:",
+            text=releases.next_version(rel["tag"] if rel else None))
+        if ok and version.strip():
+            self.build_release(sw, repo, version.strip())
+
+    def build_release(self, sw, repo, version=None):
+        """Build on GitHub in the background, then republish the catalogue."""
+        reg = self.reg
+
+        def work(progress):
+            v = version
+            if not v:
+                rel = releases.latest_release(repo)
+                v = releases.next_version(rel["tag"] if rel else None)
+            return releases.build_and_catalogue(reg, sw, repo, v, progress=progress)
+        wk = Worker(work, self)
+        self.workers.append(wk)
+        wk.progress.connect(lambda m: self.statusBar().showMessage(f"{sw['name']}: {m}"))
+
+        def done(r):
+            reg.save()
+            self.refresh_all()
+            self.statusBar().showMessage(r.splitlines()[0], 20000)
+            QMessageBox.information(self, "Release build", r)
+        wk.done.connect(done)
+        wk.failed.connect(lambda e: QMessageBox.warning(self, "Release build", e))
+        wk.finished.connect(lambda: self.workers.remove(wk) if wk in self.workers else None)
+        wk.start()
+        self.statusBar().showMessage(f"{sw['name']}: starting the release build… (if you close "
+                                     "Classifier, GitHub carries on; the catalogue is then "
+                                     "updated at the next Check GitHub)", 20000)
 
     # ---------------------------------------------------------------- catalogue
     def auto_catalogue(self, snap=None):

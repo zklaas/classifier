@@ -272,6 +272,153 @@ class Catalogue(unittest.TestCase):
         self.assertIn("pip install --user PyQt6", text)
 
 
+def _png(width: int) -> bytes:
+    import struct
+    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + struct.pack(">II", width, width) + b"\0" * 8
+
+
+class Releases(unittest.TestCase):
+    def _app(self, extra=None):
+        tmp = Path(tempfile.mkdtemp())
+        files = {
+            "README.md": "# Deck Tool\n\nA small card program. It shuffles.\n\n## Use\n\nRun it.\n",
+            "decktool.py": ("import os, sys\nfrom PyQt6 import QtWidgets\nimport helpers\n"
+                            "HERE = os.path.dirname(os.path.abspath(__file__))\n"
+                            "DECKS = os.path.join(HERE, 'decks')\n"
+                            "SETTINGS = os.path.join(HERE, 'settings.json')\n"
+                            "if __name__ == '__main__':\n    pass\n"),
+            "helpers.py": "import sounddevice\n",
+            "_check_all.py": ("HERE = __file__\nopen(HERE + '.log', 'w')\n"
+                              "if __name__ == '__main__':\n    pass\n"),
+            "make_icon.py": "if __name__ == '__main__':\n    pass\n",
+            "decks/a.json": "{}", "notes/todo.txt": "x",
+            "icons/decktool-256.png": _png(256), "icons/decktool-16.png": _png(16),
+            "icons/decktool.ico": b"\0", "install.sh": "python3 decktool.py\n",
+        }
+        files.update(extra or {})
+        d = make_soft(tmp, "DeckTool", files)
+        sw = model.new_software("DeckTool", str(d))
+        sw["scan"] = scanner.scan(d, OWNERS)
+        sw["platforms"] = {"Windows": {"track": "supported"}, "Linux": {"track": "untested"}}
+        return sw, d
+
+    def test_setup_plan_and_write(self):
+        from classifier import releases
+        sw, d = self._app()
+        self.assertIsNone(releases.setup_info(d))
+        self.assertEqual(releases.entry_point(sw)[0], "decktool.py")
+        plan = releases.plan_setup(sw, {"licensor": "Test Person", "contact": "t@example.org"},
+                                   "me/decktool")
+        self.assertEqual(plan["problems"], [])
+        i = plan["info"]
+        self.assertEqual(i["platforms"], ["Windows", "Linux"])
+        self.assertEqual(i["data"], ["decks/", "icons/"])        # notes/ is not opened by name
+        self.assertEqual(i["icons"]["png"], "icons/decktool-256.png")
+        self.assertIn("sounddevice", i["collect"])
+        self.assertTrue(i["gui"] and i["mic"])
+        self.assertEqual(set(plan["files"]), {".github/workflows/release.yml",
+                                              "packaging/decktool.iss", "packaging/release-notes.md"})
+        wf = plan["files"][".github/workflows/release.yml"]
+        self.assertIn("python -m pip install pyinstaller PyQt6 sounddevice", wf)
+        self.assertIn('--add-data "decks${{ matrix.sep }}decks"', wf)
+        self.assertIn("DeckTool-Linux-x86_64.AppImage", wf)
+        self.assertNotIn("macos-latest", wf)
+        self.assertIn("t@example.org", plan["files"]["packaging/release-notes.md"])
+        # saving beside itself is found in what the program imports, not in a check script
+        warn = " ".join(plan["warnings"])
+        self.assertIn("saves files beside itself", warn)
+        self.assertIn("decktool.py:6", warn)
+        self.assertNotIn("_check_all", warn)
+        self.assertIn("## Download\n", plan["readme"])
+        self.assertLess(plan["readme"].index("## Download"), plan["readme"].index("## Use"))
+        releases.write_setup(sw, plan)
+        info = releases.setup_info(d)
+        self.assertEqual(info["workflow"], "release.yml")
+        self.assertTrue(info["dispatch"] and info["version_input"])
+        again = releases.plan_setup(sw, {}, "me/decktool")
+        self.assertTrue(any("already set up" in p for p in again["problems"]))
+        self.assertIsNone(releases.plan_setup(sw, {}, "me/decktool", force=True)["readme"])
+        try:
+            import yaml
+            yaml.safe_load(wf)
+        except ImportError:
+            pass
+
+    def test_frozen_check_and_webengine(self):
+        from classifier import releases
+        sw, d = self._app({"decktool.py": (
+            "import os, sys\nfrom PyQt6.QtWebEngineWidgets import QWebEngineView\n"
+            "HERE = os.path.dirname(os.path.abspath(__file__))\n"
+            "def data_dir():\n    if getattr(sys, 'frozen', False):\n"
+            "        return os.path.expanduser('~/.local/share/DeckTool')\n"
+            "    return os.path.join(HERE, 'data')\n"
+            "if __name__ == '__main__':\n    pass\n")})
+        probs = " ".join(releases.problems_when_packaged(sw))
+        self.assertNotIn("beside itself", probs)               # it checks sys.frozen
+        self.assertIn("QTWEBENGINE_DISABLE_SANDBOX", probs)
+        plan = releases.plan_setup(sw, {}, "me/decktool")
+        self.assertIn("PyQt6-WebEngine", plan["info"]["pip"])
+        self.assertIn("QTWEBENGINE_DISABLE_SANDBOX", plan["files"][".github/workflows/release.yml"])
+
+    def test_no_clear_entry_and_patterns_in_strings(self):
+        from classifier import releases
+        sw, d = self._app({"decktool.py": "x = 'QAudioSource QtWebEngine'  # QCamera\n",
+                           "one.py": "if __name__ == '__main__':\n    pass\n",
+                           "two.py": "if __name__ == '__main__':\n    pass\n"})
+        self.assertIsNone(releases.entry_point(sw)[0])
+        plan = releases.plan_setup(sw, {}, "me/decktool")
+        self.assertTrue(any("Which script" in p for p in plan["problems"]))
+        self.assertEqual(plan["files"], {})
+        code = {"a.py": "PAT = 'QAudioSource|QtWebEngine'  # QCamera\n"}
+        self.assertFalse(releases.uses(releases.MIC, code))
+        self.assertFalse(releases.uses_webengine(code))
+
+    def test_versions_docs_and_audit(self):
+        from classifier import releases
+        self.assertEqual(releases.next_version(None), "1.0.0")
+        self.assertEqual(releases.next_version("v1.2.3"), "1.2.4")
+        self.assertEqual(releases.next_version("v2"), "2.0.1")
+        self.assertTrue(releases.is_doc("README.md") and releases.is_doc("packaging/x.iss"))
+        self.assertFalse(releases.is_doc("app/gui.py"))
+        sw, d = self._app()
+        self.assertEqual(releases.affects_package(
+            ["decktool.py", "helpers.py", "make_icon.py", "notes/todo.txt", "decks/b.json"], sw),
+            ["decktool.py", "helpers.py", "decks/b.json"])
+        reg = model.Registry(Path(tempfile.mkdtemp()) / "reg.json")
+        reg.software["DeckTool"] = sw
+        st = {"DeckTool": {"group": model.RELEASABLE}}
+        placed = {"DeckTool": [{"repo": "me/decktool", "path": "", "branches": ["main"],
+                                "visibility": "PUBLIC"}]}
+        calls = []
+        old_latest, old_changed = releases.latest_release, releases.changed_since
+        try:
+            releases.latest_release = lambda repo: calls.append(repo) or None
+            releases.changed_since = lambda repo, tag: []
+            issues = releases.audit(reg, st, placed, {"me/decktool": {"branches": {"main": []}}})
+            self.assertEqual(len(issues), 1)
+            self.assertIn("has no downloads", issues[0]["message"])
+            self.assertEqual(releases.summary(sw), "none")
+            self.assertEqual(releases.audit(reg, {"DeckTool": {"group": model.FINISHED_PRIVATE}},
+                                            placed), [])
+            releases.write_setup(sw, releases.plan_setup(sw, {}, "me/decktool"))
+            issues = releases.audit(reg, st, placed, {"me/decktool": {"branches": {"main": []}}})
+            self.assertTrue(any("not on GitHub yet" in i["message"] for i in issues))
+            issues = releases.audit(reg, st, placed, {"me/decktool": {"branches": {
+                "main": [".github/workflows/release.yml"]}}})
+            self.assertTrue(any("no release has been built" in i["message"] for i in issues))
+            releases.latest_release = lambda repo: {"tag": "v1.0.0", "at": "2026-01-02T00:00:00Z",
+                                                    "assets": ["DeckTool-Setup-Windows.exe"]}
+            releases.changed_since = lambda repo, tag: ["decktool.py", "README.md"]
+            issues = releases.audit(reg, st, placed, None)
+            msgs = " ".join(i["message"] for i in issues)
+            self.assertIn("older than its code: 1 file(s)", msgs)
+            self.assertIn("no download for Linux", msgs)
+            self.assertEqual(releases.summary(sw), "v1.0.0 (older than code)")
+            self.assertTrue(all(i["action"] is None for i in issues))
+        finally:
+            releases.latest_release, releases.changed_since = old_latest, old_changed
+
+
 class Publish(unittest.TestCase):
     def test_plan_and_rules(self):
         import subprocess

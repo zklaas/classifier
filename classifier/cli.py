@@ -1,11 +1,13 @@
-"""Terminal commands: classifier list | scan | show | licence | github | review."""
+"""Terminal commands: classifier list | scan | show | licence | github | publish | release |
+catalogue | review."""
 
 from __future__ import annotations
 
 import argparse
 import sys
 
-from . import aiuse, catalogue, github, publish, licences, model, platforms, review, status
+from . import (aiuse, catalogue, github, publish, licences, model, platforms, releases, review,
+               status)
 
 
 def _reg() -> model.Registry:
@@ -83,6 +85,9 @@ def cmd_show(a):
               + (f"  ({ev[0]})" if ev else ""))
     for w in platforms.warnings(sw):
         print(f"    ! {w}")
+    print("  Downloads:")
+    for line in releases.describe(sw):
+        print(f"    {line}")
     langs = (sw.get("scan") or {}).get("languages", {})
     if langs:
         print("  Languages (lines): " + ", ".join(f"{k} {v:,}" for k, v in langs.items()))
@@ -127,6 +132,8 @@ def cmd_github(a):
     for n, sw in reg.software.items():
         if sw.get("scan"):
             status.review_platforms(sw, placed.get(n, []))
+    print("Looking at releases (downloads) ...")
+    issues += releases.audit(reg, statuses, placed, snap)
     reg.save()
     if not issues:
         print("GitHub matches every Development Group.")
@@ -247,6 +254,87 @@ def cmd_publish(a):
         status.scan(sw, reg.owner_names(), reg.settings)   # the folder changed: keep it Cleared
         reg.save()
     _auto_catalogue(reg)
+    if a.release:
+        public = (a.make_public or (dest["exists"] and dest.get("visibility") == "PUBLIC")
+                  or (not dest["exists"] and vis == "public"))
+        if dest["path"] or not public:
+            print("No release built: downloads are made for software that is a whole public "
+                  "repository.")
+            return
+        _build(reg, sw, dest["repo"], a.version)
+
+
+def _build(reg, sw, repo, version=None):
+    rel = releases.latest_release(repo)
+    version = version or releases.next_version(rel["tag"] if rel else None)
+    print(releases.build_and_catalogue(reg, sw, repo, version, progress=print))
+    reg.save()
+
+
+def _public_repo(reg, sw) -> str:
+    owner = reg.settings.get("github_owner") or model.gh_login()
+    if not owner:
+        sys.exit("gh is not logged in (gh auth login).")
+    print("Reading GitHub ...")
+    snap = github.snapshot(owner)
+    statuses = {n: status.of(s, reg.settings) for n, s in reg.software.items()}
+    _, placed = github.audit(reg, snap, statuses)
+    loc = next((l for l in placed.get(sw["name"], []) if not l["path"]), None)
+    return loc["repo"] if loc else publish.destination(sw, placed, owner)["repo"]
+
+
+def cmd_release(a):
+    reg = _reg()
+    sw = _pick(reg, a.name)
+    if a.setup:
+        repo = a.repo or _public_repo(reg, sw)
+        plan = releases.plan_setup(sw, reg.settings, repo, entry=a.entry, force=a.force)
+        i = plan["info"]
+        if i:
+            print(f"{i['title']}: starts with {i['entry'] or '?'}; downloads for "
+                  f"{', '.join(i['platforms'])} from {repo}")
+            print(f"  packages: {' '.join(i['pip'])}")
+            print(f"  bundled beside it: {', '.join(i['data']) or 'nothing'}")
+            for p, n in i["assets"].items():
+                print(f"  {p}: {n}")
+        for w in plan["warnings"]:
+            print(f"  ! {w}")
+        for p in plan["problems"]:
+            print(f"  CANNOT: {p}")
+        if plan["problems"]:
+            sys.exit(1)
+        names = list(plan["files"]) + (["README (adds a Download section)"]
+                                       if plan["readme"] is not None else [])
+        print("Will write: " + ", ".join(names))
+        if a.dry_run:
+            return
+        if input("Write these files into the software's folder? [y/N] ").strip().lower() != "y":
+            print("Nothing written.")
+            return
+        for rel in releases.write_setup(sw, plan):
+            print(f"Wrote {rel}")
+        status.scan(sw, reg.owner_names(), reg.settings)
+        reg.save()
+        print(f"Next: classifier publish {sw['name']} --release   (pushes, builds the "
+              "downloads, then updates the catalogue)")
+        return
+    if a.build:
+        repo = a.repo or _public_repo(reg, sw)
+        if not releases.setup_info(sw["path"]):
+            sys.exit(f"{sw['name']} has no release build set up: classifier release "
+                     f"{sw['name']} --setup")
+        rel = releases.latest_release(repo)
+        version = a.version or releases.next_version(rel["tag"] if rel else None)
+        if input(f"Build release {version} of {repo} on GitHub (about 10-20 minutes), then "
+                 "update the catalogue? [y/N] ").strip().lower() != "y":
+            print("Nothing done.")
+            return
+        _build(reg, sw, repo, version)
+        return
+    for line in releases.describe(sw):
+        print(line)
+    for p in releases.problems_when_packaged(sw):
+        print(f"! {p}")
 
 
 def cmd_review(a):
@@ -299,7 +387,24 @@ def main(argv):
                    help="make the existing private repository public (history checked first)")
     p.add_argument("--sync", action="store_true",
                    help="bring the new commit into the folder's own git copy")
+    p.add_argument("--release", action="store_true",
+                   help="then build a new release (downloads) and update the catalogue "
+                        "when it is done")
+    p.add_argument("--version", help="version number for --release (default: the next one)")
     p.set_defaults(fn=cmd_publish)
+    p = sub.add_parser("release", help="downloadable packages: show, set up or build")
+    p.add_argument("name")
+    p.add_argument("--setup", action="store_true",
+                   help="write a release build (GitHub Actions + PyInstaller) into the folder")
+    p.add_argument("--entry", help="with --setup: the script that starts the program")
+    p.add_argument("--force", action="store_true",
+                   help="with --setup: replace a release build that is already there")
+    p.add_argument("--dry-run", action="store_true", help="with --setup: only show the plan")
+    p.add_argument("--build", action="store_true",
+                   help="build a new release on GitHub, wait, then update the catalogue")
+    p.add_argument("--version", help="with --build: version number (default: the next one)")
+    p.add_argument("--repo", help="owner/name instead of the one Classifier finds")
+    p.set_defaults(fn=cmd_release)
     p = sub.add_parser("catalogue", help="the public page of releasable software")
     p.add_argument("--out", help="write it to this file instead of printing it")
     p.add_argument("--publish", action="store_true",

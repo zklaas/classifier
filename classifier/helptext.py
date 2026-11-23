@@ -183,6 +183,9 @@ branch if the repository is shared. A folder removal leaves it in the repository
 history. Removals always ask you to type the repository's name first.</li>
 <li>Warnings: Releasable software public without a passing licence; Excluded files
 found in a public repository; unclassified software in a public repository.</li>
+<li>Downloads (see <i>Downloads</i> below): public Releasable software with no release
+build, a release build but no release, or a release older than the files that go into
+it.</li>
 </ul>
 <h3>Commit and push</h3>
 <p><b>Commit and push to GitHub…</b> (GitHub tab) publishes the selected software. It
@@ -222,6 +225,44 @@ to commit.</li>
 
 <p>Deleting a repository needs the <code>delete_repo</code> permission:
 <code>gh auth refresh -h github.com -s delete_repo</code>.</p>
+
+<h3>Downloads</h3>
+<p>A <b>download</b> is a ready-to-run package of a program, built by GitHub: a Windows
+installer, a macOS disk image and a Linux AppImage, for the platforms whose track is
+Supported (or Supported, untested). Python and every package the program uses are
+inside, so people need nothing else. They are attached to a GitHub <b>release</b> under
+names that stay the same from release to release, so the catalogue's
+<i>Download the program</i> links always give the newest one. The catalogue shows those
+links only when the repository's latest release has packages; the <b>Downloads</b>
+column and the GitHub tab say where each program stands.</p>
+<ul>
+<li><b>Set up downloads…</b> (GitHub tab) writes a release build into the software's
+folder: a GitHub Actions workflow (<code>.github/workflows/release.yml</code>) that builds
+with PyInstaller and checks that the program starts, a Windows installer script
+(<code>packaging/</code>), release notes with what to click the first time, and a
+<i>Download</i> section in the README. It works for Python programs: it finds the
+script that starts the program (you can choose another), the packages it needs, the
+files and folders it opens by name (bundled beside it), its icons, and whether it uses
+a microphone or camera (macOS asks the user's permission). Every file is shown before
+anything is written; an existing release build is only replaced when you tick so.
+For other languages, write a workflow by hand: any workflow that creates a GitHub
+release is recognised.</li>
+<li><b>What breaks once packaged.</b> A packaged program's own folder is read-only (macOS,
+Linux AppImage) or replaced by every update (Windows), so a program that saves settings,
+data or caches beside itself must save them elsewhere when it runs packaged
+(<code>sys.frozen</code>): the user's data folder or Documents. Classifier looks for such
+writes in the code the program imports and warns; a file that already checks
+<code>sys.frozen</code> is taken to handle it. A program using QtWebEngine also needs its
+sandbox switched off inside an AppImage.</li>
+<li><b>Build a release…</b> runs the build on GitHub (about 10-20 minutes), waits, then
+updates the catalogue. It builds what is on GitHub, so Commit and push first. In
+<b>Commit and push</b>, tick <i>Then build a new release</i> to do both in one go. The
+version number suggested is the next after the latest release. If you close Classifier
+meanwhile, GitHub carries on and the next Check GitHub picks up the new downloads.</li>
+<li><b>Out of date.</b> Check GitHub compares the latest release with the files that go
+into the package (the code the program imports and the data it bundles; documentation
+does not count) and notes when they have changed since.</li>
+</ul>
 
 <h3>7. Catalogue</h3>
 <p><b>Catalogue…</b> builds one public page about your released software. It reads GitHub
@@ -266,7 +307,12 @@ classifier github [--fix]  the GitHub check (--fix asks before each change)
 classifier platform NAME PLATFORM none|planned|progress|untested|supported
 classifier review NAME     open Claude's review window
 classifier catalogue [--out FILE]   the public page (Markdown)
-classifier publish NAME [--dry-run] [--public]   commit and push to GitHub</pre>
+classifier publish NAME [--dry-run] [--public] [--release]   commit and push to GitHub
+                           (--release: then build the downloads, then the catalogue)
+classifier release NAME    where its downloads stand
+classifier release NAME --setup [--entry FILE] [--dry-run] [--force]
+                           write a release build into its folder
+classifier release NAME --build [--version X]   build a release, then the catalogue</pre>
 """
 
 PLATFORM_HTML = """
